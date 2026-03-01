@@ -92,7 +92,9 @@ io.on('connection', (socket) => {
   // Forward state events to this socket
   const events = [
     'price:binance', 'price:redstone', 'balance', 'markets',
-    'intent', 'model', 'trade', 'position:open', 'position:close',
+    'intent', 'model', 'trade',
+    'order:pending', 'order:removed',
+    'position:open', 'position:close', 'position:updated',
     'stats', 'connection:kalshi', 'connection:polymarket', 'connection:binance',
   ];
 

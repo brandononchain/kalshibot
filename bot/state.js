@@ -46,7 +46,8 @@ class BotState extends EventEmitter {
     this.polymarketCache = {};
 
     // Positions
-    this.openPositions = [];
+    this.pendingOrders = [];   // Orders placed but not yet confirmed filled
+    this.openPositions = [];   // Confirmed filled positions
     this.closedPositions = [];
 
     // Trade log (all actions)
@@ -132,11 +133,14 @@ class BotState extends EventEmitter {
       if (Array.isArray(saved.pnlHistory)) {
         this.pnlHistory = saved.pnlHistory.slice(-MAX_PNL_HISTORY);
       }
+      if (Array.isArray(saved.pendingOrders)) {
+        this.pendingOrders = saved.pendingOrders;
+      }
       if (Array.isArray(saved.openPositions)) {
         this.openPositions = saved.openPositions;
       }
 
-      console.log(`[State] Loaded: ${this.stats.totalTrades} trades, P&L: $${this.stats.totalPnL.toFixed(2)}, ${this.openPositions.length} open positions, uptime since ${new Date(this.stats.startTime).toISOString()}`);
+      console.log(`[State] Loaded: ${this.stats.totalTrades} trades, P&L: $${this.stats.totalPnL.toFixed(2)}, ${this.pendingOrders.length} pending, ${this.openPositions.length} open positions, uptime since ${new Date(this.stats.startTime).toISOString()}`);
     } catch (err) {
       console.error('[State] Failed to load persisted state:', err.message);
     }
@@ -159,6 +163,7 @@ class BotState extends EventEmitter {
       const data = {
         _savedAt: new Date().toISOString(),
         stats: { ...this.stats },
+        pendingOrders: this.pendingOrders,
         openPositions: this.openPositions,
         closedPositions: this.closedPositions.slice(-MAX_CLOSED_POSITIONS),
         tradeLog: this.tradeLog
@@ -253,6 +258,20 @@ class BotState extends EventEmitter {
     }
   }
 
+  addPendingOrder(order) {
+    this.pendingOrders.push(order);
+    this.emit('order:pending', order);
+    this._scheduleSave();
+  }
+
+  removePendingOrder(orderId) {
+    const idx = this.pendingOrders.findIndex(o => o.orderId === orderId);
+    if (idx === -1) return;
+    const removed = this.pendingOrders.splice(idx, 1)[0];
+    this.emit('order:removed', removed);
+    this._scheduleSave();
+  }
+
   addPosition(position) {
     this.openPositions.push(position);
     this.emit('position:open', position);
@@ -343,6 +362,7 @@ class BotState extends EventEmitter {
       btcPrice: this.btcPrice,
       balance: this.balance,
       activeMarkets: this.activeMarkets,
+      pendingOrders: this.pendingOrders,
       openPositions: this.openPositions,
       closedPositions: this.closedPositions.slice(-50),
       tradeLog: this.tradeLog.slice(0, 50),

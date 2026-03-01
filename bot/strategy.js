@@ -217,13 +217,14 @@ class Strategy {
           type: 'DIRECTIONAL_YES',
           ticker: market.ticker,
           side: 'yes',
-          priceCents: market.yesBidCents || Math.round(market.yesAsk * 100),
+          priceCents: market.yesAskCents || Math.round(market.yesAsk * 100),
           priceDecimal: market.yesAsk,
           edge: adjustedEdgeYes,
           contracts,
           modelProb: prob.probUp,
           reason: `Spot +${(prob.movePct || 0).toFixed(3)}% | Model ${(prob.probUp * 100).toFixed(0)}% vs Kalshi ${(kalshiYesImplied * 100).toFixed(0)}% | 1H: ${currentTrend}${trendMultYes !== 1.0 ? ' (' + trendMultYes.toFixed(2) + 'x)' : ''}`,
           closeTime: market.closeTime,
+          executionMode: 'taker',
         });
       }
 
@@ -243,13 +244,14 @@ class Strategy {
           type: 'DIRECTIONAL_NO',
           ticker: market.ticker,
           side: 'no',
-          priceCents: market.noBidCents || Math.round(market.noAsk * 100),
+          priceCents: market.noAskCents || Math.round(market.noAsk * 100),
           priceDecimal: market.noAsk,
           edge: adjustedEdgeNo,
           contracts,
           modelProb: prob.probDown,
           reason: `Spot ${(prob.movePct || 0).toFixed(3)}% | Model ${(prob.probDown * 100).toFixed(0)}% vs Kalshi ${(market.noAsk * 100).toFixed(0)}% | 1H: ${currentTrend}${trendMultNo !== 1.0 ? ' (' + trendMultNo.toFixed(2) + 'x)' : ''}`,
           closeTime: market.closeTime,
+          executionMode: 'taker',
         });
       }
 
@@ -275,13 +277,14 @@ class Strategy {
             type: 'POLY_ARB_YES',
             ticker: market.ticker,
             side: 'yes',
-            priceCents: market.yesBidCents || Math.round(market.yesAsk * 100),
+            priceCents: market.yesAskCents || Math.round(market.yesAsk * 100),
             priceDecimal: market.yesAsk,
             edge: polyEdgeYes,
             contracts,
             modelProb: polyFairUp,
             reason: `Poly UP mid=${(polyFairUp * 100).toFixed(1)}% vs Kalshi ask=${(market.yesAsk * 100).toFixed(1)}%`,
             closeTime: market.closeTime,
+            executionMode: 'taker',
           });
         }
 
@@ -308,6 +311,7 @@ class Strategy {
           reason: `Dual-side: YES@${(market.yesAsk * 100).toFixed(0)} + NO@${(market.noAsk * 100).toFixed(0)} = ${(combinedCost * 100).toFixed(0)}c < $1`,
           closeTime: market.closeTime,
           isDualSide: true,
+          executionMode: 'taker',
         });
 
         signals.push({
@@ -322,6 +326,7 @@ class Strategy {
           reason: `Dual-side: YES@${(market.yesAsk * 100).toFixed(0)} + NO@${(market.noAsk * 100).toFixed(0)} = ${(combinedCost * 100).toFixed(0)}c < $1`,
           closeTime: market.closeTime,
           isDualSide: true,
+          executionMode: 'taker',
         });
       }
     }

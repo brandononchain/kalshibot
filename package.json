@@ -23,6 +23,7 @@
   "license": "MIT",
   "dependencies": {
     "axios": "^1.6.0",
+    "better-sqlite3": "^12.6.2",
     "dotenv": "^16.3.1",
     "express": "^4.21.0",
     "socket.io": "^4.7.5",

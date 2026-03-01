@@ -57,6 +57,11 @@ class KalshiClient {
     return axios.post(`${this.baseUrl}${apiPath}`, body, { ...auth, timeout: 8000 });
   }
 
+  async delete(apiPath) {
+    const auth = this.generateAuth('DELETE', apiPath);
+    return axios.delete(`${this.baseUrl}${apiPath}`, { ...auth, timeout: 8000 });
+  }
+
   async fetchBalance() {
     try {
       const resp = await this.get('/trade-api/v2/portfolio/balance');
@@ -118,6 +123,11 @@ class KalshiClient {
   async getOrder(orderId) {
     const resp = await this.get(`/trade-api/v2/portfolio/orders/${orderId}`);
     return resp.data.order;
+  }
+
+  async cancelOrder(orderId) {
+    const resp = await this.delete(`/trade-api/v2/portfolio/orders/${orderId}`);
+    return resp.data;
   }
 
   // Fetch actual positions from Kalshi (for reconciliation on startup)

@@ -5,6 +5,8 @@ const PolymarketFeed = require('./polymarket');
 const RedstoneFeed = require('./redstone');
 const Strategy = require('./strategy');
 const TrendIndicator = require('./trend');
+const OrderManager = require('./order-manager');
+const AnalyticsDB = require('./db');
 
 class BotEngine {
   constructor(config) {
@@ -18,6 +20,8 @@ class BotEngine {
     this.polymarket = new PolymarketFeed(this.state, config);
     this.redstone = new RedstoneFeed(this.state);
     this.strategy = new Strategy(this.state, config, this.binance, this.trend);
+    this.db = new AnalyticsDB();
+    this.orderManager = new OrderManager(this.kalshi, this.state, this.db, config);
 
     this.scanInterval = null;
     this.discoveryInterval = null;
@@ -99,6 +103,10 @@ class BotEngine {
     if (this.state.btcPrice.binance) {
       this.log(`BTC price: $${this.state.btcPrice.binance.toFixed(2)}`);
     }
+
+    // Start order lifecycle manager
+    this.orderManager.start();
+    this.log('Order manager started');
 
     // Start periodic tasks
     this.discoveryInterval = setInterval(() => this.discoverMarkets(), 15000);
@@ -195,6 +203,7 @@ class BotEngine {
     this.state.updateIntent({ message: 'Reconciling positions with Kalshi...' });
     try {
       // Step 0: Prune locally-tracked positions with 0 fills (ghost orders that never executed)
+      // With OrderManager, these should be rare, but clean up any legacy entries
       const beforePrune = this.state.openPositions.length;
       this.state.openPositions = this.state.openPositions.filter(p => {
         if ((p.filledContracts || 0) === 0 && p.type !== 'RECONCILED') {
@@ -205,6 +214,13 @@ class BotEngine {
       });
       if (beforePrune !== this.state.openPositions.length) {
         this.log(`Pruned ${beforePrune - this.state.openPositions.length} unfilled ghost positions`);
+      }
+
+      // Also clear any stale pending orders from previous runs
+      const stalePending = this.state.pendingOrders.length;
+      if (stalePending > 0) {
+        this.log(`Clearing ${stalePending} stale pending orders from previous session`, 'WARN');
+        this.state.pendingOrders = [];
       }
 
       const kalshiPositions = await this.kalshi.fetchPositions(this.seriesTicker);
@@ -386,29 +402,46 @@ class BotEngine {
   }
 
   async executeSignal(signal) {
-    // Check position limits
-    if (this.state.openPositions.length >= this.maxOpenPositions) {
+    // Check position limits (pending + open both count)
+    const totalExposure = this.state.openPositions.length + this.state.pendingOrders.length;
+    if (totalExposure >= this.maxOpenPositions) {
+      this.db.logSignal(signal, false, 'max_positions');
       this.log('Max positions reached, skipping', 'WARN');
       return;
     }
 
-    const existingOnTicker = this.state.openPositions.filter(
-      p => p.ticker === signal.ticker
-    );
-    if (existingOnTicker.length >= this.maxPerContract) return;
+    const existingOnTicker = [
+      ...this.state.openPositions.filter(p => p.ticker === signal.ticker),
+      ...this.state.pendingOrders.filter(p => p.ticker === signal.ticker),
+    ];
+    if (existingOnTicker.length >= this.maxPerContract) {
+      this.db.logSignal(signal, false, 'per_contract_cap');
+      return;
+    }
 
     // Check balance
     const cost = signal.priceDecimal * signal.contracts;
     if (cost > this.state.balance.available) {
+      this.db.logSignal(signal, false, 'insufficient_balance');
       this.log(`Insufficient balance for ${signal.ticker}`, 'WARN');
       return;
     }
 
     // Check cumulative dollar exposure on this ticker (prevent stacking)
-    const existingCost = existingOnTicker.reduce((sum, p) => sum + (p.totalCost || 0), 0);
+    const existingCost = existingOnTicker.reduce((sum, p) => sum + (p.totalCost || p.reservedCost || 0), 0);
     if (existingCost + cost > this.maxPositionSize * 1.5) {
+      this.db.logSignal(signal, false, 'ticker_exposure_cap');
       this.log(`Ticker exposure cap: ${signal.ticker} already $${existingCost.toFixed(2)}, rejecting $${cost.toFixed(2)}`, 'WARN');
       return;
+    }
+
+    // Log signal as executed
+    const signalId = this.db.logSignal(signal, true);
+
+    // Snapshot market state around execution
+    const market = this.state.activeMarkets.find(m => m.ticker === signal.ticker);
+    if (market) {
+      this.db.logMarketSnapshot(market, this.state.btcPrice.binance, 'pre_execution');
     }
 
     try {
@@ -441,27 +474,44 @@ class BotEngine {
 
       this.log(`Order ${order.order_id}: ${order.status} | Filled: ${order.fill_count || 0}/${signal.contracts}`, 'SUCCESS');
 
-      const position = {
+      // Log order to SQLite
+      this.db.logOrder({
+        order_id: order.order_id,
+        client_order_id: clientOrderId,
+        ticker: signal.ticker,
+        side: signal.side,
+        action: 'buy',
+        price_cents: signal.priceCents,
+        count: signal.contracts,
+        status: order.status,
+        fill_count: order.fill_count || 0,
+        taker_fill_cost: order.taker_fill_cost || 0,
+        taker_fees: order.taker_fees || 0,
+        close_time: signal.closeTime,
+      }, signalId);
+
+      // Add to pending orders — OrderManager will promote to openPositions on fill
+      const pendingOrder = {
         orderId: order.order_id,
         clientOrderId,
         ticker: signal.ticker,
-        type: signal.type,
+        signalType: signal.type,
         side: signal.side,
         contracts: signal.contracts,
-        filledContracts: order.fill_count || 0,
+        fillCount: order.fill_count || 0,
         priceCents: signal.priceCents,
         priceDecimal: signal.priceDecimal,
-        totalCost: cost,
+        reservedCost: cost,
         edge: signal.edge,
         modelProb: signal.modelProb,
         reason: signal.reason,
-        entryTime: Date.now(),
+        placedAt: Date.now(),
         closeTime: signal.closeTime,
-        status: order.status,
+        orderStatus: order.status,
         isDualSide: signal.isDualSide || false,
       };
 
-      this.state.addPosition(position);
+      this.orderManager.addPendingOrder(pendingOrder);
 
       // Immediately deduct cost from local balance (prevents race condition
       // where next scan sees stale balance before 15s API refresh)
@@ -487,10 +537,10 @@ class BotEngine {
       // Emit stats immediately so UI updates on execution
       this.state.emitStats();
 
-      // Schedule settlement
+      // Schedule settlement check (only for confirmed positions)
       const timeToSettle = signal.closeTime - Date.now() + 60000;
       if (timeToSettle > 0) {
-        setTimeout(() => this.settlePosition(position), timeToSettle);
+        setTimeout(() => this.settlePosition(pendingOrder.orderId), timeToSettle);
       }
 
       // Refresh balance
@@ -567,15 +617,27 @@ class BotEngine {
     }
   }
 
-  async settlePosition(position) {
+  async settlePosition(orderId) {
+    // Find the position — it may still be pending or already promoted
+    const position = this.state.openPositions.find(p => p.orderId === orderId);
+    if (!position) {
+      // Check if still pending (unfilled) — clean up
+      const pending = this.state.pendingOrders.find(p => p.orderId === orderId);
+      if (pending) {
+        this.log(`Order ${orderId} still pending at settlement time, removing`, 'WARN');
+        this.state.removePendingOrder(orderId);
+      }
+      return;
+    }
+
     try {
-      const order = await this.kalshi.getOrder(position.orderId);
+      const order = await this.kalshi.getOrder(orderId);
       const filled = order.fill_count || 0;
 
       if (filled === 0) {
-        this.log(`Order ${position.orderId} never filled, removing`, 'WARN');
+        this.log(`Order ${orderId} never filled, removing`, 'WARN');
         this.state.openPositions = this.state.openPositions.filter(
-          p => p.orderId !== position.orderId
+          p => p.orderId !== orderId
         );
         this.state.emit('position:removed', position);
         return;
@@ -585,17 +647,23 @@ class BotEngine {
 
       if (!market || (market.result !== 'yes' && market.result !== 'no')) {
         this.log(`${position.ticker} not settled yet, retrying in 30s`, 'WARN');
-        setTimeout(() => this.settlePosition(position), 30000);
+        setTimeout(() => this.settlePosition(orderId), 30000);
         return;
       }
 
       const won = position.side === market.result;
-      const costCents = order.taker_fill_cost + (order.taker_fees || 0);
+      const costCents = (order.taker_fill_cost || 0) + (order.taker_fees || 0);
       const costDollars = costCents / 100;
       const payout = won ? filled * 1.00 : 0;
       const pnl = payout - costDollars;
 
-      this.state.closePosition(position.orderId, {
+      // Update order in SQLite
+      this.db.updateOrder(orderId, 'settled', filled, order.taker_fill_cost || 0, order.taker_fees || 0);
+
+      // Snapshot market at settlement
+      this.db.logMarketSnapshot(market, this.state.btcPrice.binance, 'settlement');
+
+      this.state.closePosition(orderId, {
         won,
         pnl,
         payout,
@@ -627,7 +695,7 @@ class BotEngine {
     } catch (err) {
       this.log(`Settlement error: ${err.message}`, 'ERROR');
       // Retry
-      setTimeout(() => this.settlePosition(position), 30000);
+      setTimeout(() => this.settlePosition(orderId), 30000);
     }
   }
 
@@ -636,6 +704,7 @@ class BotEngine {
     this.binance.stop();
     this.polymarket.stop();
     this.redstone.stop();
+    this.orderManager.stop();
 
     if (this.scanInterval) clearInterval(this.scanInterval);
     if (this.discoveryInterval) clearInterval(this.discoveryInterval);
@@ -648,6 +717,8 @@ class BotEngine {
     });
 
     this.log(`Shutdown. Trades: ${this.state.stats.totalTrades} | P&L: $${this.state.stats.totalPnL.toFixed(2)}`);
+
+    this.db.close();
   }
 }
 
