@@ -611,6 +611,11 @@ socket.on('connection:binance', (connected) => {
 
 socket.on('bot:status', (data) => {
   updateToggleUI(data.running);
+  if (data.error) {
+    console.error('Bot error:', data.error);
+    state.intent = { ...state.intent, status: 'error', message: data.error };
+    updateIntent(state.intent);
+  }
 });
 
 socket.on('disconnect', () => {

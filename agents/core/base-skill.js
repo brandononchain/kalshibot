@@ -23,6 +23,9 @@ class BaseSkill extends EventEmitter {
     super();
     if (!name) throw new Error('Skill must have a name');
 
+    // Prevent Node.js from throwing on unhandled 'error' events
+    this.on('error', () => {});
+
     this.name = name;
     this.description = description || '';
     this.domain = domain || 'general';

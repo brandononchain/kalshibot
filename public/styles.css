@@ -322,6 +322,13 @@ body {
   border: 1px solid rgba(255, 23, 68, 0.2);
 }
 
+.status-badge.error {
+  color: #ff6e40;
+  background: rgba(255, 110, 64, 0.15);
+  border: 1px solid rgba(255, 110, 64, 0.3);
+  animation: pulse 1.5s infinite;
+}
+
 @keyframes pulse {
   0%, 100% { opacity: 1; }
   50% { opacity: 0.6; }

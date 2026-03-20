@@ -82,6 +82,7 @@ app.get('/api/health', (req, res) => {
 // Bot control: start/stop
 app.post('/api/bot/start', (req, res) => {
   if (agent.running) {
+    io.emit('bot:status', { running: true });
     return res.json({ status: 'already_running' });
   }
   // Respond immediately — start() is long-running (connects to feeds, waits for prices)
@@ -98,6 +99,7 @@ app.post('/api/bot/start', (req, res) => {
 
 app.post('/api/bot/stop', (req, res) => {
   if (!agent.running) {
+    io.emit('bot:status', { running: false });
     return res.json({ status: 'already_stopped' });
   }
   agent.stop();

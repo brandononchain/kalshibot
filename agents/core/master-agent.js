@@ -219,86 +219,97 @@ class MasterAgent extends EventEmitter {
       message: 'Initializing agent skills...',
     });
 
-    // Build shared context for all skills
-    const context = {
-      config: this.config,
-      registry: this.registry,
-      orchestrator: this.orchestrator,
-    };
+    try {
+      // Build shared context for all skills
+      const context = {
+        config: this.config,
+        registry: this.registry,
+        orchestrator: this.orchestrator,
+      };
 
-    // Initialize skills in dependency order
-    const initOrder = this.registry.getInitOrder();
-    this.log(`Init order: ${initOrder.join(' → ')}`);
+      // Initialize skills in dependency order
+      const initOrder = this.registry.getInitOrder();
+      this.log(`Init order: ${initOrder.join(' → ')}`);
 
-    for (const skillName of initOrder) {
-      const skill = this.registry.get(skillName);
-      try {
-        await skill.initialize(context);
-        this.log(`  initialized ${skillName}`);
-      } catch (err) {
-        this.log(`  ${skillName} failed: ${err.message}`, 'ERROR');
-        throw err;
+      for (const skillName of initOrder) {
+        const skill = this.registry.get(skillName);
+        try {
+          await skill.initialize(context);
+          this.log(`  initialized ${skillName}`);
+        } catch (err) {
+          this.log(`  ${skillName} failed: ${err.message}`, 'ERROR');
+          throw err;
+        }
       }
-    }
 
-    // Start all skills
-    for (const skillName of initOrder) {
-      const skill = this.registry.get(skillName);
-      try {
-        await skill.start();
-      } catch (err) {
-        this.log(`  ${skillName} start failed: ${err.message}`, 'ERROR');
+      // Start all skills
+      for (const skillName of initOrder) {
+        const skill = this.registry.get(skillName);
+        try {
+          await skill.start();
+        } catch (err) {
+          this.log(`  ${skillName} start failed: ${err.message}`, 'ERROR');
+        }
       }
+
+      this.log('All skills started');
+
+      // Run startup workflow: fetch balance → reconcile positions → discover markets
+      stateManager.botState.updateIntent({
+        status: 'initializing',
+        message: 'Connecting to Kalshi...',
+      });
+
+      const startupResult = await this.orchestrator.dispatch({
+        action: 'startup',
+        workflow: 'startup',
+        params: {},
+      });
+
+      if (!startupResult.success) {
+        this.log(`Startup workflow failed: ${JSON.stringify(startupResult)}`, 'WARN');
+        this.log('Continuing anyway — periodic refresh will retry Kalshi connection', 'WARN');
+      } else {
+        const balance = stateManager.botState.balance;
+        this.log(`Kalshi connected. Balance: $${balance.total.toFixed(2)}`);
+        this.log(`Tracking ${stateManager.botState.activeMarkets.length} markets (${this.config.SERIES_TICKER})`);
+      }
+
+      // Wait for Binance price feed
+      stateManager.botState.updateIntent({
+        status: 'waiting',
+        message: 'Waiting for Binance price feed...',
+      });
+
+      await this._waitForPrice();
+
+      // Start the OrderManager (manages fill polling and stale order cancellation)
+      const orderExecutor = this.registry.get('order-executor');
+      this.log('Order manager started');
+
+      // Start periodic auto-trade loops
+      this._scanInterval = setInterval(() => this._runScan(), 2000);
+      this._takeProfitInterval = setInterval(() => this._runTakeProfit(), 3000);
+      this._discoveryInterval = setInterval(() => this._runDiscovery(), 15000);
+      this._balanceInterval = setInterval(() => this._runBalanceRefresh(), 15000);
+
+      stateManager.botState.updateIntent({
+        status: 'scanning',
+        message: 'Scanning for opportunities...',
+      });
+
+      this.log('Engine running. All systems active.');
+      return stateManager.botState;
+    } catch (err) {
+      // Reset running flag so the bot can be restarted
+      this.running = false;
+      this.log(`Start failed: ${err.message}`, 'ERROR');
+      stateManager.botState.updateIntent({
+        status: 'error',
+        message: `Start failed: ${err.message}`,
+      });
+      throw err;
     }
-
-    this.log('All skills started');
-
-    // Run startup workflow: fetch balance → reconcile positions → discover markets
-    stateManager.botState.updateIntent({
-      status: 'initializing',
-      message: 'Connecting to Kalshi...',
-    });
-
-    const startupResult = await this.orchestrator.dispatch({
-      action: 'startup',
-      workflow: 'startup',
-      params: {},
-    });
-
-    if (!startupResult.success) {
-      this.log(`Startup workflow failed: ${JSON.stringify(startupResult)}`, 'WARN');
-      this.log('Continuing anyway — periodic refresh will retry Kalshi connection', 'WARN');
-    } else {
-      const balance = stateManager.botState.balance;
-      this.log(`Kalshi connected. Balance: $${balance.total.toFixed(2)}`);
-      this.log(`Tracking ${stateManager.botState.activeMarkets.length} markets (${this.config.SERIES_TICKER})`);
-    }
-
-    // Wait for Binance price feed
-    stateManager.botState.updateIntent({
-      status: 'waiting',
-      message: 'Waiting for Binance price feed...',
-    });
-
-    await this._waitForPrice();
-
-    // Start the OrderManager (manages fill polling and stale order cancellation)
-    const orderExecutor = this.registry.get('order-executor');
-    this.log('Order manager started');
-
-    // Start periodic auto-trade loops
-    this._scanInterval = setInterval(() => this._runScan(), 2000);
-    this._takeProfitInterval = setInterval(() => this._runTakeProfit(), 3000);
-    this._discoveryInterval = setInterval(() => this._runDiscovery(), 15000);
-    this._balanceInterval = setInterval(() => this._runBalanceRefresh(), 15000);
-
-    stateManager.botState.updateIntent({
-      status: 'scanning',
-      message: 'Scanning for opportunities...',
-    });
-
-    this.log('Engine running. All systems active.');
-    return stateManager.botState;
   }
 
   async _waitForPrice() {

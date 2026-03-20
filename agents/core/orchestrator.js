@@ -21,6 +21,9 @@ class Orchestrator extends EventEmitter {
   constructor(registry) {
     super();
     this.registry = registry;
+
+    // Prevent Node.js from throwing on unhandled 'error' events
+    this.on('error', () => {});
     this._workflows = new Map();  // workflowName → workflow definition
     this._routes = new Map();     // action → routing rule
     this.metrics = {
