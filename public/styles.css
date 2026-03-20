@@ -113,6 +113,49 @@ body {
   font-variant-numeric: tabular-nums;
 }
 
+/* Bot Toggle Button */
+.bot-toggle {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 14px;
+  border: 1px solid var(--green);
+  border-radius: 4px;
+  background: rgba(0, 230, 118, 0.08);
+  color: var(--green);
+  font-family: inherit;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 2px;
+  cursor: pointer;
+  transition: all 0.2s;
+}
+
+.bot-toggle:hover {
+  background: rgba(0, 230, 118, 0.18);
+  box-shadow: 0 0 12px rgba(0, 230, 118, 0.2);
+}
+
+.bot-toggle.running {
+  border-color: var(--red);
+  background: rgba(255, 23, 68, 0.08);
+  color: var(--red);
+}
+
+.bot-toggle.running:hover {
+  background: rgba(255, 23, 68, 0.18);
+  box-shadow: 0 0 12px rgba(255, 23, 68, 0.2);
+}
+
+.bot-toggle:disabled {
+  opacity: 0.5;
+  cursor: wait;
+}
+
+.toggle-icon {
+  font-size: 10px;
+}
+
 /* Main Grid */
 .grid {
   display: grid;

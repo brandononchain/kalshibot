@@ -429,6 +429,44 @@ setInterval(() => {
   el('uptime').textContent = `${h}:${m}:${s}`;
 }, 1000);
 
+// ========== Bot Toggle ==========
+let botRunning = false;
+const toggleBtn = el('bot-toggle');
+const toggleIcon = el('toggle-icon');
+const toggleLabel = el('toggle-label');
+
+function updateToggleUI(running) {
+  botRunning = running;
+  if (running) {
+    toggleBtn.classList.add('running');
+    toggleBtn.classList.remove('stopped');
+    toggleIcon.innerHTML = '&#9632;'; // stop square
+    toggleLabel.textContent = 'STOP';
+  } else {
+    toggleBtn.classList.remove('running');
+    toggleBtn.classList.add('stopped');
+    toggleIcon.innerHTML = '&#9654;'; // play triangle
+    toggleLabel.textContent = 'START';
+  }
+}
+
+toggleBtn.addEventListener('click', async () => {
+  toggleBtn.disabled = true;
+  toggleLabel.textContent = botRunning ? 'STOPPING...' : 'STARTING...';
+  try {
+    const endpoint = botRunning ? '/api/bot/stop' : '/api/bot/start';
+    const res = await fetch(endpoint, { method: 'POST' });
+    const data = await res.json();
+    if (data.status === 'error') {
+      console.error('Bot toggle error:', data.message);
+    }
+  } catch (err) {
+    console.error('Bot toggle failed:', err);
+  } finally {
+    toggleBtn.disabled = false;
+  }
+});
+
 // ========== Socket.io Handlers ==========
 socket.on('connect', () => {
   console.log('Connected to Kalshibot server');
@@ -571,7 +609,12 @@ socket.on('connection:binance', (connected) => {
   updateConnections(state.connections);
 });
 
+socket.on('bot:status', (data) => {
+  updateToggleUI(data.running);
+});
+
 socket.on('disconnect', () => {
   console.log('Disconnected from server');
+  updateToggleUI(false);
   updateConnections({ binance: false, polymarket: false, kalshi: false, redstone: false });
 });

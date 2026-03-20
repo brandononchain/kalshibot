@@ -76,7 +76,34 @@ const agent = new MasterAgent(config);
 
 // Health check
 app.get('/api/health', (req, res) => {
-  res.json({ status: 'ok', uptime: process.uptime() });
+  res.json({ status: 'ok', uptime: process.uptime(), botRunning: agent.running });
+});
+
+// Bot control: start/stop
+app.post('/api/bot/start', async (req, res) => {
+  if (agent.running) {
+    return res.json({ status: 'already_running' });
+  }
+  try {
+    await agent.start();
+    io.emit('bot:status', { running: true });
+    res.json({ status: 'started' });
+  } catch (err) {
+    res.status(500).json({ status: 'error', message: err.message });
+  }
+});
+
+app.post('/api/bot/stop', (req, res) => {
+  if (!agent.running) {
+    return res.json({ status: 'already_stopped' });
+  }
+  agent.stop();
+  io.emit('bot:status', { running: false });
+  res.json({ status: 'stopped' });
+});
+
+app.get('/api/bot/status', (req, res) => {
+  res.json({ running: agent.running });
 });
 
 // API: get current state
@@ -122,6 +149,7 @@ io.on('connection', (socket) => {
   console.log(`[Server] UI connected: ${socket.id}`);
 
   // Send full snapshot on connect
+  socket.emit('bot:status', { running: agent.running });
   if (agent.state) {
     socket.emit('snapshot', agent.state.getSnapshot());
   }
@@ -164,9 +192,8 @@ server.listen(PORT, () => {
   console.log(`  Skills API: http://localhost:${PORT}/api/skills`);
   console.log(`  Config: ${config.SERIES_TICKER} | MinEdge=${config.MIN_EDGE}% | MinDiv=${config.MIN_DIVERGENCE}% | MaxPos=$${config.MAX_POSITION_SIZE}\n`);
 
-  agent.start().catch(err => {
-    console.error('[MasterAgent] Failed to start:', err.message);
-  });
+  // Bot does NOT auto-start — user controls via dashboard toggle
+  console.log('  Bot is IDLE. Use the dashboard toggle to start trading.\n');
 });
 
 // Graceful shutdown
