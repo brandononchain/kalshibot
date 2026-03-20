@@ -1,11 +1,24 @@
 #!/usr/bin/env node
 
+/**
+ * Kalshibot Server — Agentic Architecture
+ *
+ * Entry point that creates the MasterAgent (which owns the Orchestrator,
+ * SkillRegistry, and all sub-agent skills), wires up the Express/Socket.io
+ * UI layer, and manages the bot lifecycle.
+ *
+ * Architecture:
+ *   server.js → MasterAgent → Orchestrator → Skills
+ *
+ * The legacy BotEngine is preserved at `node kalshi-bot.js` for fallback.
+ */
+
 require('dotenv').config();
 const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
 const path = require('path');
-const BotEngine = require('./bot/engine');
+const { MasterAgent } = require('./agents');
 
 const PORT = process.env.PORT || 3333;
 
@@ -55,6 +68,9 @@ const io = new Server(server, {
 // Serve static UI
 app.use(express.static(path.join(__dirname, 'public')));
 
+// Create the MasterAgent
+const agent = new MasterAgent(config);
+
 // Health check
 app.get('/api/health', (req, res) => {
   res.json({ status: 'ok', uptime: process.uptime() });
@@ -62,32 +78,39 @@ app.get('/api/health', (req, res) => {
 
 // API: get current state
 app.get('/api/state', (req, res) => {
-  if (engine && engine.state) {
-    res.json(engine.state.getSnapshot());
+  if (agent && agent.state) {
+    res.json(agent.state.getSnapshot());
   } else {
-    res.json({ error: 'Engine not started' });
+    res.json({ error: 'Agent not started' });
   }
 });
 
 // API: force save state to disk
 app.post('/api/save', (req, res) => {
-  if (engine && engine.state) {
-    engine.state.saveNow();
+  if (agent && agent.state) {
+    agent.state.saveNow();
     res.json({ status: 'saved' });
   } else {
-    res.json({ error: 'Engine not started' });
+    res.json({ error: 'Agent not started' });
   }
 });
 
-// Start bot engine
-const engine = new BotEngine(config);
+// API: get agent skill registry status
+app.get('/api/skills', (req, res) => {
+  res.json({
+    skills: agent.registry.describeAll(),
+    orchestrator: agent.orchestrator.describe(),
+  });
+});
 
 // Socket.io: push updates to UI
 io.on('connection', (socket) => {
   console.log(`[Server] UI connected: ${socket.id}`);
 
   // Send full snapshot on connect
-  socket.emit('snapshot', engine.state.getSnapshot());
+  if (agent.state) {
+    socket.emit('snapshot', agent.state.getSnapshot());
+  }
 
   // Forward state events to this socket
   const events = [
@@ -101,16 +124,18 @@ io.on('connection', (socket) => {
   const handlers = {};
   for (const event of events) {
     handlers[event] = (data) => socket.emit(event, data);
-    engine.state.on(event, handlers[event]);
+    if (agent.state) {
+      agent.state.on(event, handlers[event]);
+    }
   }
-
-  // No periodic snapshot push — rely on event forwarding + snapshot on connect
 
   socket.on('disconnect', () => {
     console.log(`[Server] UI disconnected: ${socket.id}`);
     for (const event of events) {
       try {
-        engine.state.removeListener(event, handlers[event]);
+        if (agent.state) {
+          agent.state.removeListener(event, handlers[event]);
+        }
       } catch (e) {
         // Ignore cleanup errors
       }
@@ -118,22 +143,23 @@ io.on('connection', (socket) => {
   });
 });
 
-// Start server, then bot
+// Start server, then agent
 server.listen(PORT, () => {
-  console.log(`\n  KALSHIBOT MISSION CONTROL`);
-  console.log(`  Dashboard: http://localhost:${PORT}`);
+  console.log(`\n  KALSHIBOT MISSION CONTROL (Agentic Architecture)`);
+  console.log(`  Dashboard:  http://localhost:${PORT}`);
+  console.log(`  Skills API: http://localhost:${PORT}/api/skills`);
   console.log(`  Config: ${config.SERIES_TICKER} | MinEdge=${config.MIN_EDGE}% | MinDiv=${config.MIN_DIVERGENCE}% | MaxPos=$${config.MAX_POSITION_SIZE}\n`);
 
-  engine.start().catch(err => {
-    console.error('[Engine] Failed to start:', err.message);
+  agent.start().catch(err => {
+    console.error('[MasterAgent] Failed to start:', err.message);
   });
 });
 
 // Graceful shutdown
 process.on('SIGINT', () => {
   console.log('\n[Server] Shutting down...');
-  engine.state.saveNow();
-  engine.stop();
+  if (agent.state) agent.state.saveNow();
+  agent.stop();
   server.close();
   process.exit(0);
 });
