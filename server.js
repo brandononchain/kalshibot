@@ -80,17 +80,20 @@ app.get('/api/health', (req, res) => {
 });
 
 // Bot control: start/stop
-app.post('/api/bot/start', async (req, res) => {
+app.post('/api/bot/start', (req, res) => {
   if (agent.running) {
     return res.json({ status: 'already_running' });
   }
-  try {
-    await agent.start();
-    io.emit('bot:status', { running: true });
-    res.json({ status: 'started' });
-  } catch (err) {
-    res.status(500).json({ status: 'error', message: err.message });
-  }
+  // Respond immediately — start() is long-running (connects to feeds, waits for prices)
+  res.json({ status: 'starting' });
+  agent.start()
+    .then(() => {
+      io.emit('bot:status', { running: true });
+    })
+    .catch((err) => {
+      console.error('[Server] Bot start failed:', err.message);
+      io.emit('bot:status', { running: false, error: err.message });
+    });
 });
 
 app.post('/api/bot/stop', (req, res) => {
