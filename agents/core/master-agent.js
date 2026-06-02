@@ -15,6 +15,7 @@
 const EventEmitter = require('events');
 const SkillRegistry = require('./skill-registry');
 const Orchestrator = require('./orchestrator');
+const tc = require('../../bot/tradecafe');
 
 // Market Data Skills
 const BinancePriceFeed = require('../skills/market-data/binance-price-feed');
@@ -49,6 +50,11 @@ class MasterAgent extends EventEmitter {
     this._takeProfitInterval = null;
     this._discoveryInterval = null;
     this._balanceInterval = null;
+    this._guardInterval = null;
+
+    // TradeCafe portfolio guard config
+    this.useTradeCafe = config.USE_TRADECAFE !== false;
+    this.tcParams = tc.resolveParams(config);
 
     this._registerSkills();
     this._configureRoutes();
@@ -291,6 +297,9 @@ class MasterAgent extends EventEmitter {
     this._takeProfitInterval = setInterval(() => this._runTakeProfit(), 3000);
     this._discoveryInterval = setInterval(() => this._runDiscovery(), 15000);
     this._balanceInterval = setInterval(() => this._runBalanceRefresh(), 15000);
+    if (this.useTradeCafe) {
+      this._guardInterval = setInterval(() => this._runDrawdownGuard(), 3000);
+    }
 
     stateManager.botState.updateIntent({
       status: 'scanning',
@@ -438,6 +447,72 @@ class MasterAgent extends EventEmitter {
   }
 
   /**
+   * TradeCafe portfolio drawdown kill-switch. Runs every 3 seconds.
+   * Tracks session peak equity (balance + unrealized P&L). If equity falls
+   * DRAWDOWN_KILL below the peak, flattens every open position and halts new
+   * entries for a cooldown — the "stop-кран" / черный-день protection.
+   */
+  async _runDrawdownGuard() {
+    if (!this.running) return;
+    const state = this.state;
+    if (!state) return;
+
+    const guard = state.tradeCafe;
+    const now = Date.now();
+    const equity = (state.balance.total || 0) + (state.stats.unrealizedPnL || 0);
+    if (equity <= 0) return;
+
+    guard.peakEquity = Math.max(guard.peakEquity || 0, equity);
+    const { tripped, drawdown } = tc.checkDrawdownKill(equity, guard.peakEquity, this.tcParams);
+    guard.drawdown = drawdown;
+
+    // Release the halt once the cooldown has elapsed and we've recovered halfway.
+    if (guard.halted && now >= guard.haltedUntil &&
+        drawdown < this.tcParams.DRAWDOWN_KILL * 0.5) {
+      guard.halted = false;
+      guard.peakEquity = equity; // reset high-water mark after a reset
+      this.log(`Drawdown guard released — equity recovered to $${equity.toFixed(2)}`, 'SUCCESS');
+    }
+
+    if (tripped && !guard.halted) {
+      guard.halted = true;
+      guard.haltedUntil = now + this.tcParams.DRAWDOWN_COOLDOWN_MS;
+      this.log(`DRAWDOWN KILL-SWITCH: equity down ${(drawdown * 100).toFixed(1)}% from peak $${guard.peakEquity.toFixed(2)} — flattening all positions`, 'ERROR');
+      await this._flattenAll();
+    }
+  }
+
+  /**
+   * Sell every open position at the current contract bid (best effort).
+   * Used by the drawdown kill-switch to flatten the book immediately.
+   */
+  async _flattenAll() {
+    const state = this.state;
+    const kalshiSkill = this.registry.get('kalshi-market-data');
+    if (!kalshiSkill) return;
+
+    for (const pos of [...state.openPositions]) {
+      try {
+        const market = state.activeMarkets.find(m => m.ticker === pos.ticker);
+        const bid = pos.side === 'yes' ? market?.yesBid : market?.noBid;
+        const sellCents = Math.max(1, Math.round((bid || 0.01) * 100));
+        const contracts = pos.filledContracts || pos.contracts;
+        const sellOrder = await kalshiSkill.getClient().sellPosition(pos.ticker, pos.side, contracts, sellCents);
+        if (sellOrder.status === 'executed' || sellOrder.fill_count > 0) {
+          const pnl = ((sellCents / 100) - pos.priceDecimal) * (sellOrder.fill_count || contracts);
+          state.closePosition(pos.orderId, {
+            won: pnl > 0, pnl, payout: (sellCents / 100) * (sellOrder.fill_count || contracts),
+            cost: pos.totalCost || 0, exitType: 'DRAWDOWN_FLATTEN',
+          });
+          this.log(`Flattened ${pos.ticker} ${pos.side} x${contracts} @ ${sellCents}c | P&L ${pnl >= 0 ? '+' : ''}$${pnl.toFixed(2)}`, 'WARN');
+        }
+      } catch (err) {
+        this.log(`Flatten error on ${pos.ticker}: ${err.message}`, 'ERROR');
+      }
+    }
+  }
+
+  /**
    * Market discovery. Runs every 15 seconds.
    * Finds new active contracts in the KXBTC15M series.
    */
@@ -474,6 +549,7 @@ class MasterAgent extends EventEmitter {
     if (this._takeProfitInterval) clearInterval(this._takeProfitInterval);
     if (this._discoveryInterval) clearInterval(this._discoveryInterval);
     if (this._balanceInterval) clearInterval(this._balanceInterval);
+    if (this._guardInterval) clearInterval(this._guardInterval);
 
     // Stop all skills in reverse init order
     const initOrder = this.registry.getInitOrder();

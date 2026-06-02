@@ -15,6 +15,7 @@
  */
 
 const BaseSkill = require('../../core/base-skill');
+const tc = require('../../../bot/tradecafe');
 
 class SignalGenerator extends BaseSkill {
   constructor() {
@@ -49,6 +50,10 @@ class SignalGenerator extends BaseSkill {
     this.tradingWindow = (config.TRADING_WINDOW || 4) * 60 * 1000;
     this.minContractPrice = (config.MIN_CONTRACT_PRICE || 48) / 100;
     this.maxContractPrice = (config.MAX_CONTRACT_PRICE || 88) / 100;
+
+    // TradeCafe discipline: capital reserve, fixed sizing, calibration, macro gate
+    this.useTradeCafe = config.USE_TRADECAFE !== false;
+    this.tcParams = tc.resolveParams(config);
   }
 
   async handleTask(task) {
@@ -103,6 +108,13 @@ class SignalGenerator extends BaseSkill {
       // Calculate model probability
       const prob = probModel.calculateImpliedProbability(btcPrice, openPrice, timeRemaining, totalDuration, binanceFeed);
 
+      // TradeCafe: correct the model's documented ~6% overconfidence by
+      // shrinking the probability toward 0.5 before we measure any edge.
+      if (this.useTradeCafe) {
+        prob.probUp = tc.calibrate(prob.probUp, this.tcParams.CALIBRATION_SHRINK);
+        prob.probDown = 1 - prob.probUp;
+      }
+
       // Get trend data
       const trendData = trendSkill.getIndicator() ? trendSkill.getIndicator().getTrend() : {};
 
@@ -131,11 +143,15 @@ class SignalGenerator extends BaseSkill {
       const adjustedEdgeNo = modelEdgeNo * trendMultNo;
       const currentTrend = trendData.trend || 'NEUTRAL';
 
-      if (adjustedEdgeYes > this.minDivergence && yesInRange) {
-        const size = this.useKelly ? probModel.kellySize(adjustedEdgeYes / 100, prob.probUp, this.kellyFraction) : 1;
-        const positionDollars = Math.min(size * state.balance.available, this.maxPositionSize, state.balance.available);
-        const contracts = Math.max(1, Math.floor(positionDollars / market.yesAsk));
+      // TradeCafe macro gate: don't fight a strong 1H trend.
+      const yesAllowed = !this.useTradeCafe ||
+        tc.macroGate('yes', currentTrend, trendData.strength, this.tcParams);
+      const noAllowed = !this.useTradeCafe ||
+        tc.macroGate('no', currentTrend, trendData.strength, this.tcParams);
 
+      if (adjustedEdgeYes > this.minDivergence && yesInRange && yesAllowed) {
+        const contracts = this._sizeEntry(state, market.ticker, 'yes', market.yesAsk, adjustedEdgeYes, prob.probUp, probModel);
+        if (contracts >= 1) {
         signals.push({
           type: 'DIRECTIONAL_YES', ticker: market.ticker, side: 'yes',
           priceCents: market.yesAskCents || Math.round(market.yesAsk * 100),
@@ -144,13 +160,12 @@ class SignalGenerator extends BaseSkill {
           reason: `Spot +${(prob.movePct || 0).toFixed(3)}% | Model ${(prob.probUp * 100).toFixed(0)}% vs Kalshi ${(kalshiYesImplied * 100).toFixed(0)}% | 1H: ${currentTrend}${trendMultYes !== 1.0 ? ' (' + trendMultYes.toFixed(2) + 'x)' : ''}`,
           closeTime: market.closeTime, executionMode: 'taker',
         });
+        }
       }
 
-      if (adjustedEdgeNo > this.minDivergence && noInRange) {
-        const size = this.useKelly ? probModel.kellySize(adjustedEdgeNo / 100, prob.probDown, this.kellyFraction) : 1;
-        const positionDollars = Math.min(size * state.balance.available, this.maxPositionSize, state.balance.available);
-        const contracts = Math.max(1, Math.floor(positionDollars / market.noAsk));
-
+      if (adjustedEdgeNo > this.minDivergence && noInRange && noAllowed) {
+        const contracts = this._sizeEntry(state, market.ticker, 'no', market.noAsk, adjustedEdgeNo, prob.probDown, probModel);
+        if (contracts >= 1) {
         signals.push({
           type: 'DIRECTIONAL_NO', ticker: market.ticker, side: 'no',
           priceCents: market.noAskCents || Math.round(market.noAsk * 100),
@@ -159,6 +174,7 @@ class SignalGenerator extends BaseSkill {
           reason: `Spot ${(prob.movePct || 0).toFixed(3)}% | Model ${(prob.probDown * 100).toFixed(0)}% vs Kalshi ${(market.noAsk * 100).toFixed(0)}% | 1H: ${currentTrend}${trendMultNo !== 1.0 ? ' (' + trendMultNo.toFixed(2) + 'x)' : ''}`,
           closeTime: market.closeTime, executionMode: 'taker',
         });
+        }
       }
 
       // ===== STRATEGY 2: POLYMARKET ARBITRAGE =====
@@ -209,6 +225,24 @@ class SignalGenerator extends BaseSkill {
     return signals;
   }
 
+  /**
+   * Fixed-fractional entry sizing off WORKING capital (TradeCafe reserve model).
+   * Falls back to legacy Kelly/flat sizing when TradeCafe is disabled.
+   */
+  _sizeEntry(state, ticker, side, price, edge, prob, probModel) {
+    if (this.useTradeCafe) {
+      // Dollars already deployed on this ticker/side (caps post-averaging size).
+      const existingCost = [...state.openPositions, ...state.pendingOrders]
+        .filter(p => p.ticker === ticker && p.side === side)
+        .reduce((s, p) => s + (p.totalCost || p.reservedCost || 0), 0);
+      const total = state.balance.total || state.balance.available || 0;
+      return tc.entryContracts(total, price, this.tcParams, existingCost);
+    }
+    const size = this.useKelly ? probModel.kellySize(edge / 100, prob, this.kellyFraction) : 1;
+    const positionDollars = Math.min(size * state.balance.available, this.maxPositionSize, state.balance.available);
+    return Math.max(1, Math.floor(positionDollars / price));
+  }
+
   _generateTakeProfitSignals(openPositions, kalshiMarkets) {
     const signals = [];
 
@@ -218,25 +252,37 @@ class SignalGenerator extends BaseSkill {
 
       const now = Date.now();
       const timeRemaining = pos.closeTime - now;
-      if (timeRemaining < 30000) continue;
-
       const currentValue = pos.side === 'yes' ? market.yesBid : market.noBid;
       const entryPrice = pos.priceDecimal;
-
       if (!currentValue || currentValue <= 0) continue;
 
-      const profitPct = ((currentValue - entryPrice) / entryPrice) * 100;
-      const maxGain = 1 - entryPrice;
-      const gainFraction = (currentValue - entryPrice) / maxGain;
+      let fire = false;
+      let reason = '';
 
-      if (profitPct > 15 || gainFraction > 0.5) {
+      if (this.useTradeCafe) {
+        // TradeCafe trailing profit-lock: arm a stop once enough of the move is
+        // banked, ride it up under the peak bid, and hard-take near certainty.
+        const ev = tc.evaluateExit(pos, currentValue, timeRemaining, this.tcParams);
+        fire = ev.exit;
+        reason = ev.exit
+          ? `${ev.reason}: bought@${(entryPrice * 100).toFixed(0)}c sell@${(currentValue * 100).toFixed(0)}c (locked ${(ev.gainFraction * 100).toFixed(0)}% of max gain)`
+          : '';
+      } else {
+        if (timeRemaining < 30000) continue;
+        const profitPct = ((currentValue - entryPrice) / entryPrice) * 100;
+        const gainFraction = (currentValue - entryPrice) / (1 - entryPrice);
+        fire = profitPct > 15 || gainFraction > 0.5;
+        reason = `Take profit: bought@${(entryPrice * 100).toFixed(0)}c sell@${(currentValue * 100).toFixed(0)}c (+${profitPct.toFixed(1)}%)`;
+      }
+
+      if (fire) {
+        const profitPct = ((currentValue - entryPrice) / entryPrice) * 100;
         signals.push({
           type: 'TAKE_PROFIT', orderId: pos.orderId, ticker: pos.ticker,
           side: pos.side, sellPriceCents: Math.round(currentValue * 100),
           sellPriceDecimal: currentValue,
           contracts: pos.filledContracts || pos.contracts,
-          profitPct,
-          reason: `Take profit: bought@${(entryPrice * 100).toFixed(0)}c sell@${(currentValue * 100).toFixed(0)}c (+${profitPct.toFixed(1)}%)`,
+          profitPct, reason,
         });
       }
     }

@@ -7,6 +7,7 @@ const Strategy = require('./strategy');
 const TrendIndicator = require('./trend');
 const OrderManager = require('./order-manager');
 const AnalyticsDB = require('./db');
+const tc = require('./tradecafe');
 
 class BotEngine {
   constructor(config) {
@@ -35,6 +36,10 @@ class BotEngine {
     this.maxOpenPositions = config.MAX_TOTAL_OPEN_POSITIONS || 10;
     this.maxPerContract = config.MAX_POSITIONS_PER_CONTRACT || 2;
     this.maxPositionSize = config.MAX_POSITION_SIZE || 25;
+
+    // TradeCafe discipline (default ON) — reserve + drawdown kill-switch
+    this.useTradeCafe = config.USE_TRADECAFE !== false;
+    this.tcParams = tc.resolveParams(config);
 
     // Shared market cache — scan() writes, checkTakeProfit() reads
     this._marketCache = { data: [], ts: 0 };
@@ -358,6 +363,12 @@ class BotEngine {
         this.state.updateUnrealizedPnL(unrealized);
       }
 
+      // TradeCafe portfolio drawdown kill-switch
+      if (this.useTradeCafe) {
+        await this.checkDrawdownGuard(refreshedMarkets);
+        if (this.state.tradeCafe.halted) { this.scanRunning = false; return; }
+      }
+
       // Generate trading signals
       const signals = this.strategy.generateSignals(
         refreshedMarkets,
@@ -425,6 +436,16 @@ class BotEngine {
       this.db.logSignal(signal, false, 'insufficient_balance');
       this.log(`Insufficient balance for ${signal.ticker}`, 'WARN');
       return;
+    }
+
+    // TradeCafe: never spend into the reserve (keep 1−working of total free)
+    if (this.useTradeCafe && !signal.isDualSide) {
+      const total = this.state.balance.total || this.state.balance.available || 0;
+      const reserve = total * (1 - this.tcParams.WORKING_CAPITAL_FRACTION);
+      if (this.state.balance.available - cost < reserve) {
+        this.db.logSignal(signal, false, 'reserve_protected');
+        return;
+      }
     }
 
     // Check cumulative dollar exposure on this ticker (prevent stacking)
@@ -551,6 +572,53 @@ class BotEngine {
         ? `${err.response.status} - ${JSON.stringify(err.response.data)}`
         : err.message;
       this.log(`Execution error: ${detail}`, 'ERROR');
+    }
+  }
+
+  /**
+   * TradeCafe drawdown kill-switch: track session peak equity; if equity falls
+   * DRAWDOWN_KILL below the peak, flatten all positions and halt new entries
+   * for a cooldown (released after recovering halfway).
+   */
+  async checkDrawdownGuard(markets) {
+    const guard = this.state.tradeCafe;
+    const now = Date.now();
+    const equity = (this.state.balance.total || 0) + (this.state.stats.unrealizedPnL || 0);
+    if (equity <= 0) return;
+
+    guard.peakEquity = Math.max(guard.peakEquity || 0, equity);
+    const { tripped, drawdown } = tc.checkDrawdownKill(equity, guard.peakEquity, this.tcParams);
+    guard.drawdown = drawdown;
+
+    if (guard.halted && now >= guard.haltedUntil && drawdown < this.tcParams.DRAWDOWN_KILL * 0.5) {
+      guard.halted = false;
+      guard.peakEquity = equity;
+      this.log(`Drawdown guard released — equity recovered to $${equity.toFixed(2)}`, 'SUCCESS');
+    }
+
+    if (tripped && !guard.halted) {
+      guard.halted = true;
+      guard.haltedUntil = now + this.tcParams.DRAWDOWN_COOLDOWN_MS;
+      this.log(`DRAWDOWN KILL-SWITCH: equity down ${(drawdown * 100).toFixed(1)}% from peak — flattening all`, 'ERROR');
+      for (const pos of [...this.state.openPositions]) {
+        try {
+          const m = markets.find(mk => mk.ticker === pos.ticker);
+          const bid = pos.side === 'yes' ? m?.yesBid : m?.noBid;
+          const cents = Math.max(1, Math.round((bid || 0.01) * 100));
+          const contracts = pos.filledContracts || pos.contracts;
+          const sell = await this.kalshi.sellPosition(pos.ticker, pos.side, contracts, cents);
+          if (sell.status === 'executed' || sell.fill_count > 0) {
+            const pnl = ((cents / 100) - pos.priceDecimal) * (sell.fill_count || contracts);
+            this.state.closePosition(pos.orderId, {
+              won: pnl > 0, pnl, payout: (cents / 100) * (sell.fill_count || contracts),
+              cost: pos.totalCost || 0, exitType: 'DRAWDOWN_FLATTEN',
+            });
+            this.log(`Flattened ${pos.ticker} ${pos.side} | P&L ${pnl >= 0 ? '+' : ''}$${pnl.toFixed(2)}`, 'WARN');
+          }
+        } catch (err) {
+          this.log(`Flatten error on ${pos.ticker}: ${err.message}`, 'ERROR');
+        }
+      }
     }
   }
 

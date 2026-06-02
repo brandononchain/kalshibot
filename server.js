@@ -59,6 +59,22 @@ const config = {
   MAX_POSITION_SIZE: parseFloat(process.env.MAX_POSITION_SIZE) || 5,
   MAX_POSITIONS_PER_CONTRACT: parseInt(process.env.MAX_POSITIONS_PER_CONTRACT) || 1,
   MAX_TOTAL_OPEN_POSITIONS: parseInt(process.env.MAX_TOTAL_OPEN_POSITIONS) || 10,
+
+  // ── TradeCafe discipline (default ON) ──
+  // Capital reserve + fixed-fractional sizing + calibration + macro gate +
+  // trailing profit-lock + drawdown kill-switch. See bot/tradecafe.js.
+  USE_TRADECAFE: process.env.USE_TRADECAFE !== 'false',
+  WORKING_CAPITAL_FRACTION: parseFloat(process.env.WORKING_CAPITAL_FRACTION) || 0.70,
+  ENTRY_FRACTION: parseFloat(process.env.ENTRY_FRACTION) || 0.02,
+  MAX_POSITION_FRACTION: parseFloat(process.env.MAX_POSITION_FRACTION) || 0.06,
+  CALIBRATION_SHRINK: parseFloat(process.env.CALIBRATION_SHRINK) || 0.88,
+  TREND_GATE_STRENGTH: parseFloat(process.env.TREND_GATE_STRENGTH) || 0.60,
+  AVERAGE_MAX_ADDS: parseInt(process.env.AVERAGE_MAX_ADDS) || 2,
+  TRAIL_ARM_FRACTION: parseFloat(process.env.TRAIL_ARM_FRACTION) || 0.35,
+  TRAIL_GAP: parseFloat(process.env.TRAIL_GAP) || 0.04,
+  HARD_TAKE_FRACTION: parseFloat(process.env.HARD_TAKE_FRACTION) || 0.85,
+  DRAWDOWN_KILL: parseFloat(process.env.DRAWDOWN_KILL) || 0.30,
+  MAX_CONCURRENT: parseInt(process.env.MAX_CONCURRENT) || 5,
 };
 
 // Express + Socket.io

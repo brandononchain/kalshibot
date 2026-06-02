@@ -1,5 +1,13 @@
 # Backtest Findings
 
+> **Update — TradeCafe risk framework.** The "over-betting destroys bankroll"
+> conclusion below drove the `bot/tradecafe.js` overhaul (capital reserve,
+> fixed-fractional sizing, probability calibration, macro gate, trailing
+> profit-lock, drawdown kill-switch). On identical seeded paths it turns the
+> baseline's ~99% drawdown into a bounded ~20% (sizing alone) and preserves
+> capital entirely when no real edge clears the calibration bar. See
+> `STRATEGY_AUDIT.md` and run `npm run backtest -- --tradecafe` / `--tcsize`.
+
 ## Key Results (7-day synthetic GBM simulation)
 
 | Config | Win Rate | P&L | Avg Win | Avg Loss | Verdict |

@@ -9,6 +9,7 @@
  */
 
 const BaseSkill = require('../../core/base-skill');
+const tc = require('../../../bot/tradecafe');
 
 class RiskManager extends BaseSkill {
   constructor() {
@@ -30,6 +31,10 @@ class RiskManager extends BaseSkill {
     this.maxOpenPositions = context.config.MAX_TOTAL_OPEN_POSITIONS || 10;
     this.maxPerContract = context.config.MAX_POSITIONS_PER_CONTRACT || 1;
     this.maxPositionSize = context.config.MAX_POSITION_SIZE || 25;
+
+    // TradeCafe discipline: capital reserve + smart concurrency + drawdown kill
+    this.useTradeCafe = context.config.USE_TRADECAFE !== false;
+    this.tcParams = tc.resolveParams(context.config);
   }
 
   async handleTask(task) {
@@ -79,30 +84,60 @@ class RiskManager extends BaseSkill {
   }
 
   _checkSignal(signal, state) {
-    // Check total position limits (pending + open)
-    const totalExposure = state.openPositions.length + state.pendingOrders.length;
-    if (totalExposure >= this.maxOpenPositions) {
-      return { approved: false, reason: 'max_positions' };
+    const cost = signal.priceDecimal * signal.contracts;
+
+    // TradeCafe: portfolio drawdown kill-switch. While tripped, no new entries.
+    if (this.useTradeCafe && state.tradeCafe && state.tradeCafe.halted) {
+      return { approved: false, reason: 'drawdown_halt' };
     }
 
-    // Check per-contract limits
+    // Concurrency cap. With TradeCafe, profit-locked positions free their slot
+    // (smart slot return) and the cap is MAX_CONCURRENT; otherwise legacy count.
+    if (this.useTradeCafe) {
+      const all = [...state.openPositions, ...state.pendingOrders];
+      if (!tc.hasOpenSlot(all, this.tcParams) && !signal.isDualSide) {
+        return { approved: false, reason: 'max_positions' };
+      }
+    } else {
+      const totalExposure = state.openPositions.length + state.pendingOrders.length;
+      if (totalExposure >= this.maxOpenPositions) {
+        return { approved: false, reason: 'max_positions' };
+      }
+    }
+
+    // Per-contract / averaging limit
     const existingOnTicker = [
       ...state.openPositions.filter(p => p.ticker === signal.ticker),
       ...state.pendingOrders.filter(p => p.ticker === signal.ticker),
     ];
-    if (existingOnTicker.length >= this.maxPerContract) {
+    const perContractCap = this.useTradeCafe
+      ? this.tcParams.AVERAGE_MAX_ADDS + 1
+      : this.maxPerContract;
+    if (existingOnTicker.length >= perContractCap) {
       return { approved: false, reason: 'per_contract_cap' };
     }
 
+    // TradeCafe: never spend into the reserve — keep (1 - working) of total free.
+    if (this.useTradeCafe) {
+      const total = state.balance.total || state.balance.available || 0;
+      const reserve = total * (1 - this.tcParams.WORKING_CAPITAL_FRACTION);
+      if (state.balance.available - cost < reserve) {
+        return { approved: false, reason: 'reserve_protected' };
+      }
+    }
+
     // Check balance
-    const cost = signal.priceDecimal * signal.contracts;
     if (cost > state.balance.available) {
       return { approved: false, reason: 'insufficient_balance' };
     }
 
     // Check cumulative ticker exposure
     const existingCost = existingOnTicker.reduce((sum, p) => sum + (p.totalCost || p.reservedCost || 0), 0);
-    if (existingCost + cost > this.maxPositionSize * 1.5) {
+    // TradeCafe caps a single ticker/side at MAX_POSITION_FRACTION of working capital.
+    const tickerCap = this.useTradeCafe
+      ? tc.workingCapital(state.balance.total || state.balance.available || 0, this.tcParams) * this.tcParams.MAX_POSITION_FRACTION
+      : this.maxPositionSize * 1.5;
+    if (existingCost + cost > tickerCap + 1e-9) {
       return { approved: false, reason: 'ticker_exposure_cap' };
     }
 

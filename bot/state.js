@@ -39,6 +39,9 @@ class BotState extends EventEmitter {
     this.balance = { total: 0, available: 0, reserved: 0 };
     this.startingBalance = 0; // Set once on first balance fetch, used for drawdown calc
 
+    // TradeCafe portfolio guard — peak equity high-water mark + kill-switch state
+    this.tradeCafe = { peakEquity: 0, drawdown: 0, halted: false, haltedUntil: 0 };
+
     // Active Kalshi markets
     this.activeMarkets = [];
 
@@ -370,6 +373,7 @@ class BotState extends EventEmitter {
       intent: this.intent,
       stats: this.stats,
       model: this.model,
+      tradeCafe: this.tradeCafe,
       startTime: this.stats.startTime,
     };
   }

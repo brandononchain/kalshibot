@@ -11,12 +11,18 @@
  * with realized volatility from Binance feed.
  */
 
+const tc = require('./tradecafe');
+
 class Strategy {
   constructor(state, config, binanceFeed, trendIndicator = null) {
     this.state = state;
     this.config = config;
     this.binanceFeed = binanceFeed;
     this.trendIndicator = trendIndicator;
+
+    // TradeCafe discipline (calibration, macro gate, fixed sizing, trailing exit)
+    this.useTradeCafe = config.USE_TRADECAFE !== false;
+    this.tcParams = tc.resolveParams(config);
 
     this.minEdge = config.MIN_EDGE || 10.0;
     this.minDivergence = config.MIN_DIVERGENCE || 10.0;
@@ -171,6 +177,12 @@ class Strategy {
       // Calculate model probability
       const prob = this.calculateImpliedProbability(btcPrice, openPrice, timeRemaining, totalDuration);
 
+      // TradeCafe: correct documented model overconfidence before measuring edge.
+      if (this.useTradeCafe) {
+        prob.probUp = tc.calibrate(prob.probUp, this.tcParams.CALIBRATION_SHRINK);
+        prob.probDown = 1 - prob.probUp;
+      }
+
       // Get trend data for model update + edge adjustment
       const trendData = this.trendIndicator ? this.trendIndicator.getTrend() : {};
 
@@ -201,18 +213,16 @@ class Strategy {
       const adjustedEdgeNo = modelEdgeNo * trendMultNo;
       const currentTrend = trendData.trend || 'NEUTRAL';
 
-      // BUY YES: model thinks UP is more likely than Kalshi price implies
-      if (adjustedEdgeYes > this.minDivergence && yesInRange) {
-        const size = this.useKelly
-          ? this.kellySize(adjustedEdgeYes / 100, prob.probUp)
-          : 1;
-        const positionDollars = Math.min(
-          size * this.state.balance.available,
-          this.maxPositionSize,
-          this.state.balance.available
-        );
-        const contracts = Math.max(1, Math.floor(positionDollars / market.yesAsk));
+      // TradeCafe macro gate: don't fight a strong 1H trend.
+      const yesAllowed = !this.useTradeCafe ||
+        tc.macroGate('yes', currentTrend, trendData.strength, this.tcParams);
+      const noAllowed = !this.useTradeCafe ||
+        tc.macroGate('no', currentTrend, trendData.strength, this.tcParams);
 
+      // BUY YES: model thinks UP is more likely than Kalshi price implies
+      if (adjustedEdgeYes > this.minDivergence && yesInRange && yesAllowed) {
+        const contracts = this._sizeEntry(market.ticker, 'yes', market.yesAsk, adjustedEdgeYes, prob.probUp);
+        if (contracts >= 1) {
         signals.push({
           type: 'DIRECTIONAL_YES',
           ticker: market.ticker,
@@ -226,20 +236,13 @@ class Strategy {
           closeTime: market.closeTime,
           executionMode: 'taker',
         });
+        }
       }
 
       // BUY NO: model thinks DOWN is more likely
-      if (adjustedEdgeNo > this.minDivergence && noInRange) {
-        const size = this.useKelly
-          ? this.kellySize(adjustedEdgeNo / 100, prob.probDown)
-          : 1;
-        const positionDollars = Math.min(
-          size * this.state.balance.available,
-          this.maxPositionSize,
-          this.state.balance.available
-        );
-        const contracts = Math.max(1, Math.floor(positionDollars / market.noAsk));
-
+      if (adjustedEdgeNo > this.minDivergence && noInRange && noAllowed) {
+        const contracts = this._sizeEntry(market.ticker, 'no', market.noAsk, adjustedEdgeNo, prob.probDown);
+        if (contracts >= 1) {
         signals.push({
           type: 'DIRECTIONAL_NO',
           ticker: market.ticker,
@@ -253,6 +256,7 @@ class Strategy {
           closeTime: market.closeTime,
           executionMode: 'taker',
         });
+        }
       }
 
       // ===== STRATEGY 2: POLYMARKET ARBITRAGE =====
@@ -338,8 +342,30 @@ class Strategy {
   }
 
   /**
-   * Check open positions for take-profit opportunities
-   * Sell before settlement if position is profitable enough
+   * Fixed-fractional entry sizing off WORKING capital (TradeCafe reserve model),
+   * with legacy Kelly/flat fallback when TradeCafe is disabled.
+   */
+  _sizeEntry(ticker, side, price, edge, prob) {
+    if (this.useTradeCafe) {
+      const existingCost = [...this.state.openPositions, ...this.state.pendingOrders]
+        .filter(p => p.ticker === ticker && p.side === side)
+        .reduce((s, p) => s + (p.totalCost || p.reservedCost || 0), 0);
+      const total = this.state.balance.total || this.state.balance.available || 0;
+      return tc.entryContracts(total, price, this.tcParams, existingCost);
+    }
+    const size = this.useKelly ? this.kellySize(edge / 100, prob) : 1;
+    const positionDollars = Math.min(
+      size * this.state.balance.available,
+      this.maxPositionSize,
+      this.state.balance.available
+    );
+    return Math.max(1, Math.floor(positionDollars / price));
+  }
+
+  /**
+   * Check open positions for take-profit opportunities.
+   * Under TradeCafe: trailing profit-lock (arm → trail → hard-take) so a
+   * position almost never closes in the red. Legacy: +15% / 50%-of-max rule.
    */
   generateTakeProfitSignals(openPositions, kalshiMarkets) {
     const signals = [];
@@ -350,29 +376,29 @@ class Strategy {
 
       const now = Date.now();
       const timeRemaining = pos.closeTime - now;
-
-      // Only take profit if enough time remains (>30s) and position is in profit
-      if (timeRemaining < 30000) continue;
-
-      let currentValue, entryPrice;
-
-      if (pos.side === 'yes') {
-        currentValue = market.yesBid; // What we could sell for
-        entryPrice = pos.priceDecimal;
-      } else {
-        currentValue = market.noBid;
-        entryPrice = pos.priceDecimal;
-      }
-
+      const currentValue = pos.side === 'yes' ? market.yesBid : market.noBid;
+      const entryPrice = pos.priceDecimal;
       if (!currentValue || currentValue <= 0) continue;
 
-      const profitPct = ((currentValue - entryPrice) / entryPrice) * 100;
+      let fire = false;
+      let reason = '';
 
-      // Take profit if >15% gain or if position has >50% of max possible gain
-      const maxGain = 1 - entryPrice;
-      const gainFraction = (currentValue - entryPrice) / maxGain;
+      if (this.useTradeCafe) {
+        const ev = tc.evaluateExit(pos, currentValue, timeRemaining, this.tcParams);
+        fire = ev.exit;
+        if (fire) {
+          reason = `${ev.reason}: bought@${(entryPrice * 100).toFixed(0)}c sell@${(currentValue * 100).toFixed(0)}c (locked ${(ev.gainFraction * 100).toFixed(0)}% of max gain)`;
+        }
+      } else {
+        if (timeRemaining < 30000) continue;
+        const profitPct = ((currentValue - entryPrice) / entryPrice) * 100;
+        const gainFraction = (currentValue - entryPrice) / (1 - entryPrice);
+        fire = profitPct > 15 || gainFraction > 0.5;
+        reason = `Take profit: bought@${(entryPrice * 100).toFixed(0)}c sell@${(currentValue * 100).toFixed(0)}c (+${profitPct.toFixed(1)}%)`;
+      }
 
-      if (profitPct > 15 || gainFraction > 0.5) {
+      if (fire) {
+        const profitPct = ((currentValue - entryPrice) / entryPrice) * 100;
         signals.push({
           type: 'TAKE_PROFIT',
           orderId: pos.orderId,
@@ -382,7 +408,7 @@ class Strategy {
           sellPriceDecimal: currentValue,
           contracts: pos.filledContracts || pos.contracts,
           profitPct,
-          reason: `Take profit: bought@${(entryPrice * 100).toFixed(0)}c sell@${(currentValue * 100).toFixed(0)}c (+${profitPct.toFixed(1)}%)`,
+          reason,
         });
       }
     }

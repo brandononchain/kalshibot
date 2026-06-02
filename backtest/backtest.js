@@ -18,6 +18,19 @@
  */
 
 const axios = require('axios');
+const tc = require('../bot/tradecafe');
+
+// Deterministic RNG (mulberry32) so baseline vs TradeCafe run on identical
+// synthetic paths AND identical execution noise — the only fair comparison.
+function seedRandom(seed) {
+  let a = seed >>> 0;
+  Math.random = function () {
+    a |= 0; a = (a + 0x6D2B79F5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
 
 // ===== Configuration =====
 const CONFIG = {
@@ -35,6 +48,10 @@ const CONFIG = {
   MAX_TOTAL_OPEN_POSITIONS: 10,
   MAX_POSITIONS_PER_CONTRACT: 1,
   SLOT_DURATION: 900, // 15 min in seconds
+
+  // TradeCafe discipline (enabled with --tradecafe). When off, legacy behaviour.
+  USE_TRADECAFE: false,
+  ...tc.TRADECAFE_DEFAULTS,
 
   // Simulation params
   STARTING_BALANCE: 100,
@@ -129,7 +146,10 @@ class SimTrend {
     if (this.fastEMA > this.slowEMA && roc > this.rocThreshold) trend = 'BULLISH';
     else if (this.fastEMA < this.slowEMA && roc < -this.rocThreshold) trend = 'BEARISH';
 
-    return { trend, warmup: true, roc };
+    const spread = Math.abs(this.fastEMA - this.slowEMA) / this.slowEMA;
+    const strength = Math.min(spread / 0.005, 1.0);
+
+    return { trend, warmup: true, roc, strength };
   }
 
   getMultiplier(side) {
@@ -317,6 +337,12 @@ async function runBacktest(options = {}) {
   const signals = [];
   const trend = new SimTrend();
 
+  // TradeCafe portfolio safety state
+  const tcParams = tc.resolveParams(CONFIG);
+  let peakEquity = balance;          // session high-water mark for drawdown kill
+  let ddKills = 0;                   // count of times the kill-switch tripped
+  let tcBlockedTrend = 0;            // entries vetoed by the macro hard gate
+
   // Price history for volatility (rolling 1-hour window)
   const priceHistory = [];
 
@@ -402,6 +428,22 @@ async function runBacktest(options = {}) {
         probDown = 1 - probUp;
       }
 
+      // TradeCafe: shrink the (overconfident) model probability toward 0.5
+      if (CONFIG.USE_TRADECAFE) {
+        probUp = tc.calibrate(probUp, tcParams.CALIBRATION_SHRINK);
+        probDown = 1 - probUp;
+      }
+
+      // TradeCafe: portfolio drawdown kill-switch — halt new entries while the
+      // session is down DRAWDOWN_KILL from its equity peak (flatten is a no-op
+      // here since the sim settles each slot instantly).
+      peakEquity = Math.max(peakEquity, balance);
+      const ddKill = CONFIG.USE_TRADECAFE &&
+        tc.checkDrawdownKill(balance, peakEquity, tcParams).tripped;
+      if (ddKill) { ddKills++; break; }
+
+      const trendState = trend.getTrend();
+
       // ===== Strategy 1: DIRECTIONAL =====
       const modelEdgeYes = (probUp - kalshi.yesAsk) * 100;
       const modelEdgeNo = (probDown - kalshi.noAsk) * 100;
@@ -414,13 +456,21 @@ async function runBacktest(options = {}) {
       const noInRange = kalshi.noAsk >= CONFIG.MIN_CONTRACT_PRICE && kalshi.noAsk <= CONFIG.MAX_CONTRACT_PRICE;
 
       // BUY YES signal
-      if (adjEdgeYes > CONFIG.MIN_DIVERGENCE && yesInRange && balance > 1) {
-        const size = CONFIG.USE_KELLY_SIZING ? kellySize(adjEdgeYes / 100, probUp, CONFIG.KELLY_FRACTION) : 0.1;
-        const positionDollars = Math.min(size * balance, CONFIG.MAX_POSITION_SIZE, balance);
-        const contracts = Math.max(1, Math.floor(positionDollars / kalshi.yesAsk));
+      const yesGated = CONFIG.USE_TRADECAFE &&
+        !tc.macroGate('yes', trendState.trend, trendState.strength, tcParams);
+      if (yesGated) tcBlockedTrend++;
+      if (adjEdgeYes > CONFIG.MIN_DIVERGENCE && yesInRange && balance > 1 && !yesGated) {
+        let contracts;
+        if (CONFIG.USE_TRADECAFE) {
+          contracts = tc.entryContracts(balance, kalshi.yesAsk, tcParams);
+        } else {
+          const size = CONFIG.USE_KELLY_SIZING ? kellySize(adjEdgeYes / 100, probUp, CONFIG.KELLY_FRACTION) : 0.1;
+          const positionDollars = Math.min(size * balance, CONFIG.MAX_POSITION_SIZE, balance);
+          contracts = Math.max(1, Math.floor(positionDollars / kalshi.yesAsk));
+        }
         const cost = contracts * kalshi.yesAsk;
 
-        if (cost <= balance) {
+        if (contracts >= 1 && cost <= balance) {
           // Execute trade
           const won = settledUp; // YES wins if price went up
           const payout = won ? contracts * 1.0 : 0;
@@ -451,13 +501,21 @@ async function runBacktest(options = {}) {
       }
 
       // BUY NO signal
-      if (adjEdgeNo > CONFIG.MIN_DIVERGENCE && noInRange && balance > 1) {
-        const size = CONFIG.USE_KELLY_SIZING ? kellySize(adjEdgeNo / 100, probDown, CONFIG.KELLY_FRACTION) : 0.1;
-        const positionDollars = Math.min(size * balance, CONFIG.MAX_POSITION_SIZE, balance);
-        const contracts = Math.max(1, Math.floor(positionDollars / kalshi.noAsk));
+      const noGated = CONFIG.USE_TRADECAFE &&
+        !tc.macroGate('no', trendState.trend, trendState.strength, tcParams);
+      if (noGated) tcBlockedTrend++;
+      if (adjEdgeNo > CONFIG.MIN_DIVERGENCE && noInRange && balance > 1 && !noGated) {
+        let contracts;
+        if (CONFIG.USE_TRADECAFE) {
+          contracts = tc.entryContracts(balance, kalshi.noAsk, tcParams);
+        } else {
+          const size = CONFIG.USE_KELLY_SIZING ? kellySize(adjEdgeNo / 100, probDown, CONFIG.KELLY_FRACTION) : 0.1;
+          const positionDollars = Math.min(size * balance, CONFIG.MAX_POSITION_SIZE, balance);
+          contracts = Math.max(1, Math.floor(positionDollars / kalshi.noAsk));
+        }
         const cost = contracts * kalshi.noAsk;
 
-        if (cost <= balance) {
+        if (contracts >= 1 && cost <= balance) {
           const won = !settledUp; // NO wins if price went down
           const payout = won ? contracts * 1.0 : 0;
           const fee = won ? payout * CONFIG.KALSHI_FEE_RATE : 0;
@@ -535,6 +593,10 @@ async function runBacktest(options = {}) {
 
   // ===== Print Results =====
   console.log('\n');
+  if (CONFIG.USE_TRADECAFE) {
+    console.log(`  [TradeCafe] reserve=${((1 - tcParams.WORKING_CAPITAL_FRACTION) * 100).toFixed(0)}% | entry=${(tcParams.ENTRY_FRACTION * 100).toFixed(1)}% of working | calib=${tcParams.CALIBRATION_SHRINK} | macro-vetoes=${tcBlockedTrend} | drawdown-halts=${ddKills}`);
+    console.log();
+  }
   printReport(trades, stratStats, totalSlots, slotsWithSignals, totalSignals, balance);
 }
 
@@ -670,8 +732,10 @@ function printReport(trades, stratStats, totalSlots, slotsWithSignals, totalSign
 async function main() {
   const args = process.argv.slice(2);
   const options = {};
+  let seed = 12345; // fixed default → reproducible runs
 
   for (let i = 0; i < args.length; i++) {
+    if (args[i] === '--seed' && args[i + 1]) seed = parseInt(args[i + 1]);
     if (args[i] === '--days' && args[i + 1]) options.days = parseInt(args[i + 1]);
     if (args[i] === '--start' && args[i + 1]) options.start = args[i + 1];
     if (args[i] === '--verbose' || args[i] === '-v') options.verbose = true;
@@ -696,6 +760,22 @@ async function main() {
       CONFIG.MIN_DIVERGENCE = 15.0;
       CONFIG.MAX_POSITION_SIZE = 5;
     }
+    if (args[i] === '--tradecafe') {
+      // TradeCafe discipline: capital reserve + fixed-fractional sizing +
+      // calibration shrink + macro hard gate + drawdown kill-switch.
+      CONFIG.USE_TRADECAFE = true;
+      CONFIG.USE_KELLY_SIZING = false;
+      CONFIG.MAX_CONTRACT_PRICE = 0.65;
+      CONFIG.MIN_CONTRACT_PRICE = 0.35;
+      CONFIG.MIN_DIVERGENCE = 6.0; // calibration already raises the real bar
+    }
+    if (args[i] === '--tcsize') {
+      // Isolate the sizing fix only: fixed-fractional + reserve, no calibration/gate.
+      CONFIG.USE_TRADECAFE = true;
+      CONFIG.USE_KELLY_SIZING = false;
+      CONFIG.CALIBRATION_SHRINK = 1.0;
+      CONFIG.TREND_HARD_GATE = false;
+    }
     if (args[i] === '--aggressive') {
       CONFIG.MAX_POSITION_SIZE = 25;
       CONFIG.KELLY_FRACTION = 0.30;
@@ -705,11 +785,17 @@ async function main() {
       console.log('Usage: node backtest/backtest.js [options]');
       console.log('  --days N     Number of days to backtest (default: 7)');
       console.log('  --start DATE Start date (e.g., 2025-06-01)');
+      console.log('  --seed N     RNG seed for reproducible runs (default: 12345)');
       console.log('  --verbose    Show individual trades');
+      console.log('  --tradecafe  Full TradeCafe discipline (reserve+calibration+gate+drawdown)');
+      console.log('  --tcsize     Sizing/reserve fix only (isolates the risk-of-ruin fix)');
+      console.log('  --optimal | --conservative | --aggressive | --flat   parameter presets');
       console.log('  --help       Show this help');
       return;
     }
   }
+
+  seedRandom(seed);
 
   console.log('\n  KALSHIBOT BACKTESTER\n');
   console.log(`  Config: MinDiv=${CONFIG.MIN_DIVERGENCE}% | MinEdge=${CONFIG.MIN_EDGE}% | Kelly=${CONFIG.KELLY_FRACTION} | MaxPos=$${CONFIG.MAX_POSITION_SIZE}`);
