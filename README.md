@@ -585,3 +585,11 @@ This software is provided for educational and research purposes only. Trading bi
 
 *Built with Node.js. No external databases. Five dependencies. One objective.*
 
+
+
+## Quant safety status
+
+- The signal engine only uses a Binance price observation within 2.5 seconds of a market's scheduled open; if that observation is unavailable, it skips the market instead of substituting the current price. This is still a spot proxy, not proof that Binance matches the market's official settlement reference; production use requires confirming that basis or wiring the official reference source.
+- Directional sizing uses the executable Kalshi ask, the standard taker-fee estimate (`rate × contracts × price × (1 − price)`, rounded up to a cent), and fee-adjusted fractional Kelly. Set `KALSHI_TAKER_FEE_RATE` for the applicable market schedule; the default `0.07` is the standard schedule and does not cover special fee multipliers.
+- The dual-side strategy is disabled because the two legs are submitted separately and are not atomic.
+- These code changes do not validate profitability. The existing synthetic backtest is not an event replay of historical Kalshi books. Do not treat its returns as evidence; calibration, realized-fill replay, and paper results must be produced from timestamped executable book observations and settlement outcomes before live deployment.

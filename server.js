@@ -52,8 +52,10 @@ const config = {
   TREND_BOOST: parseFloat(process.env.TREND_BOOST) || 0.25,
   TREND_PENALTY: parseFloat(process.env.TREND_PENALTY) || 0.40,
 
+  KALSHI_TAKER_FEE_RATE: parseFloat(process.env.KALSHI_TAKER_FEE_RATE) || 0.07,
+
   // Position sizing
-  // Backtest-optimized: conservative Kelly to survive binary option variance
+  // Fractional Kelly is applied to fee-adjusted contract economics
   USE_KELLY_SIZING: process.env.USE_KELLY_SIZING !== 'false',
   KELLY_FRACTION: parseFloat(process.env.KELLY_FRACTION) || 0.08,
   MAX_POSITION_SIZE: parseFloat(process.env.MAX_POSITION_SIZE) || 5,

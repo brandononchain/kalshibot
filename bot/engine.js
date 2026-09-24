@@ -148,9 +148,11 @@ class BotEngine {
 
         const ticker = m.ticker;
 
-        // Record the BTC price at market open as reference
-        if (!this.state.marketOpenPrices[ticker] && this.state.btcPrice.binance) {
-          this.state.marketOpenPrices[ticker] = this.state.btcPrice.binance;
+        // Use only a recorded spot observation near the scheduled open.
+        const reference = this.binance.getPriceAt(openTime, 2500);
+        if (!this.state.marketOpenPrices[ticker] && reference) {
+          this.state.marketOpenPrices[ticker] = reference.price;
+          this.state.marketOpenPriceMeta[ticker] = { source: 'binance_at_market_open', timestamp: reference.timestamp };
         }
 
         processed.push({
@@ -184,6 +186,7 @@ class BotEngine {
       for (const ticker of Object.keys(this.state.marketOpenPrices)) {
         if (!processed.find(m => m.ticker === ticker)) {
           delete this.state.marketOpenPrices[ticker];
+          delete this.state.marketOpenPriceMeta[ticker];
         }
       }
     } catch (err) {

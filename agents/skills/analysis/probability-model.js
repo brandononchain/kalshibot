@@ -33,10 +33,10 @@ class ProbabilityModel extends BaseSkill {
       }
 
       case 'kelly-size': {
-        const { edge, probability } = task.params || {};
+        const { probability, price, feePerContract = 0 } = task.params || {};
         const config = this.context.config;
-        const kellyFraction = config.KELLY_FRACTION || 0.25;
-        return { size: this.kellySize(edge, probability, kellyFraction) };
+        const kellyFraction = config.KELLY_FRACTION ?? 0.08;
+        return { size: this.kellySize(probability, price, feePerContract, kellyFraction) };
       }
 
       default:
@@ -92,12 +92,9 @@ class ProbabilityModel extends BaseSkill {
     };
   }
 
-  kellySize(edge, probability, kellyFraction = 0.25) {
-    if (probability <= 0.01 || probability >= 0.99) return 0;
-    const b = (1 / (1 - probability)) - 1;
-    const q = 1 - probability;
-    const kelly = (b * probability - q) / b;
-    return Math.max(0, Math.min(kelly * kellyFraction, 0.25));
+  kellySize(probability, executablePrice, feePerContract = 0, kellyFraction = 0.08) {
+    const { kellyBankrollFraction } = require('../../../lib/kalshi-economics');
+    return kellyBankrollFraction(probability, executablePrice, feePerContract, kellyFraction);
   }
 }
 

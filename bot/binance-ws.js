@@ -180,6 +180,18 @@ class BinanceFeed {
     }
   }
 
+  // Return an observation close to the contract's scheduled reference time.
+  // Never replace a missed open observation with current spot.
+  getPriceAt(timestamp, toleranceMs = 2500) {
+    if (!Number.isFinite(timestamp) || this.priceHistory.length === 0) return null;
+    let nearest = null;
+    for (const sample of this.priceHistory) {
+      if (!nearest || Math.abs(sample.timestamp - timestamp) < Math.abs(nearest.timestamp - timestamp)) nearest = sample;
+    }
+    if (!nearest || Math.abs(nearest.timestamp - timestamp) > toleranceMs) return null;
+    return { price: nearest.price, timestamp: nearest.timestamp };
+  }
+
   // Estimate realized volatility from recent price history
   getRecentVolatility(windowSeconds = 300) {
     const cutoff = Date.now() - windowSeconds * 1000;

@@ -21,12 +21,13 @@ class KalshiMarketData extends BaseSkill {
         'fetch-balance', 'discover-markets', 'refresh-markets', 'fetch-market',
         'reconcile-positions', 'place-order', 'get-order', 'cancel-order', 'sell-position',
       ],
-      dependencies: ['state-manager'],
+      dependencies: ['state-manager', 'binance-price-feed'],
     });
 
     this.client = null;
     this.seriesTicker = null;
     this.slotDuration = 900;
+    this.binanceFeed = null;
     this._marketCache = { data: [], ts: 0 };
     this._marketCacheTTL = 3000;
   }
@@ -37,6 +38,7 @@ class KalshiMarketData extends BaseSkill {
     this.client = new KalshiClient(context.config, stateManager.botState);
     this.seriesTicker = context.config.SERIES_TICKER || 'KXBTC15M';
     this.slotDuration = context.config.SLOT_DURATION || 900;
+    this.binanceFeed = context.registry.get('binance-price-feed').getFeed();
   }
 
   async start() {
@@ -114,8 +116,13 @@ class KalshiMarketData extends BaseSkill {
         if (closeTime <= now) continue;
 
         const ticker = m.ticker;
-        if (!state.marketOpenPrices[ticker] && state.btcPrice.binance) {
-          state.marketOpenPrices[ticker] = state.btcPrice.binance;
+        if (!state.marketOpenPrices[ticker]) {
+          const reference = this.binanceFeed?.getPriceAt(new Date(m.open_time).getTime(), 2500);
+          if (reference) {
+            state.marketOpenPrices[ticker] = reference.price;
+            state.marketOpenPriceMeta ||= {};
+            state.marketOpenPriceMeta[ticker] = { source: 'binance_at_market_open', timestamp: reference.timestamp };
+          }
         }
 
         processed.push({
@@ -133,6 +140,7 @@ class KalshiMarketData extends BaseSkill {
           noBidCents: m.no_bid,
           noAskCents: m.no_ask,
           lastPrice: m.last_price / 100,
+          feeMultiplier: m.fee_multiplier == null || !Number.isFinite(Number(m.fee_multiplier)) ? 1 : Number(m.fee_multiplier),
           minutesUntilClose: Math.floor((closeTime - now) / 60000),
           secondsUntilClose: Math.floor((closeTime - now) / 1000),
           status: m.status,
@@ -145,6 +153,7 @@ class KalshiMarketData extends BaseSkill {
       for (const ticker of Object.keys(state.marketOpenPrices)) {
         if (!processed.find(m => m.ticker === ticker)) {
           delete state.marketOpenPrices[ticker];
+          if (state.marketOpenPriceMeta) delete state.marketOpenPriceMeta[ticker];
         }
       }
 

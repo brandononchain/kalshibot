@@ -1,3 +1,5 @@
+> **Validity notice (2026-09):** These results are from the prior synthetic GBM simulator and are not a valid chronological replay of Kalshi order books or fills. The simulator uses future within-slot price data for indicators and applies settlement P&L before the simulated settlement time. Treat all numbers below as diagnostic only; do not use them as expected returns or deployment evidence. A data-backed replay requires timestamped Kalshi executable book snapshots, quote sizes, latency, cancellations, actual fees, and settlement outcomes.
+
 # Backtest Findings
 
 ## Key Results (7-day synthetic GBM simulation)
