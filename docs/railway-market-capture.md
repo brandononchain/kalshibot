@@ -24,7 +24,7 @@ Use a dedicated Railway service for capture. The repository's web service can ke
    | `CAPTURE_SERIES_TICKER` | `KXBTC15M` |
    | `CAPTURE_BINANCE_SYMBOL` | `btcusdt` |
 
-   Keep the key ID and private key in Railway's encrypted service variables. Do not commit them, add them to a Docker image, or put them in a public build argument. Encode the PEM locally before entering it as a Railway variable; for example, on macOS or Linux run `base64 < kalshi_private_key.pem | tr -d '\\n'`. Never send the private key to chat or GitHub.
+   Keep the key ID and private key in Railway's encrypted service variables. Do not commit them, add them to a Docker image, or put them in a public build argument. Encode the PEM locally before entering it as a Railway variable; for example, on macOS or Linux run `base64 < kalshi_private_key.pem | tr -d '\n'`. Never send the private key to chat or GitHub.
 
 6. Deploy the service, then inspect its deploy logs. It should report WebSocket connections and begin writing `/data/captures/kalshi-KXBTC15M-YYYY-MM-DD.jsonl`. If authentication or network setup fails, the collector records the error and reconnects with backoff.
 7. Check the Railway volume usage periodically and download/copy the capture files before removing the volume or deleting the service.
