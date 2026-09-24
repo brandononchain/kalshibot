@@ -23,11 +23,14 @@ Use a dedicated Railway service for capture. The repository's web service can ke
    | `KALSHI_API_BASE` | `https://external-api.kalshi.com` |
    | `CAPTURE_SERIES_TICKER` | `KXBTC15M` |
    | `CAPTURE_BINANCE_SYMBOL` | `btcusdt` |
+   | `CAPTURE_MAX_BYTES` | `134217728` (128 MiB per run) |
+   | `CAPTURE_DISK_RESERVE_BYTES` | `67108864` (64 MiB reserved) |
+   | `CAPTURE_MAX_QUEUED_BYTES` | `4194304` (4 MiB write queue) |
 
    Keep the key ID and private key in Railway's encrypted service variables. Do not commit them, add them to a Docker image, or put them in a public build argument. Encode the PEM locally before entering it as a Railway variable; for example, on macOS or Linux run `base64 < kalshi_private_key.pem | tr -d '\n'`. Never send the private key to chat or GitHub.
 
-6. Deploy the service, then inspect its deploy logs. It should report WebSocket connections and begin writing `/data/captures/kalshi-KXBTC15M-YYYY-MM-DD.jsonl`. If authentication or network setup fails, the collector records the error and reconnects with backoff.
-7. Check the Railway volume usage periodically and download/copy the capture files before removing the volume or deleting the service.
+6. Deploy the service, then inspect its deploy logs. It should report WebSocket connections and write a unique JSONL file under `/data/captures/`. The collector pauses feed sockets under file-write backpressure, bounds its in-memory queue, and stops cleanly when its per-run byte budget or reserved-disk threshold is reached. Do not increase these limits until you have observed the actual capture rate and volume capacity.
+7. Check Railway volume usage periodically and download/copy captures before deleting them. Each run has a byte cap, but captures still consume persistent volume space over time; archive or remove old runs before starting a new long collection.
 
 ## What this service does
 
