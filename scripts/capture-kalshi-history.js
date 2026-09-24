@@ -14,6 +14,9 @@ const binanceSymbol = (process.env.CAPTURE_BINANCE_SYMBOL || 'btcusdt').toLowerC
 const intervalMs = Math.max(1000, Number(process.env.CAPTURE_DISCOVERY_INTERVAL_MS || 10000));
 const outputDir = path.resolve(process.env.CAPTURE_OUTPUT_DIR || './data/captures');
 const stopAfterMinutes = Number(process.env.CAPTURE_DURATION_MINUTES || 0);
+const requestedMaxBytes = Number(process.env.CAPTURE_MAX_BYTES || 128 * 1024 * 1024);
+const reserveBytes = Number(process.env.CAPTURE_DISK_RESERVE_BYTES || 64 * 1024 * 1024);
+const maxQueuedBytes = Number(process.env.CAPTURE_MAX_QUEUED_BYTES || 4 * 1024 * 1024);
 const startTime = Date.now();
 
 if (!process.env.KALSHI_API_KEY) {
@@ -33,10 +36,34 @@ try { client.loadPrivateKey(); } catch (error) {
 }
 
 fs.mkdirSync(outputDir, { recursive: true });
-const date = new Date().toISOString().slice(0, 10);
-const outputPath = path.join(outputDir, `kalshi-${seriesTicker}-${date}.jsonl`);
-const output = fs.createWriteStream(outputPath, { flags: 'a' });
+const runId = new Date().toISOString().replace(/[:.]/g, '-');
+const outputPath = path.join(outputDir, `kalshi-${seriesTicker}-${runId}.jsonl`);
+const output = fs.createWriteStream(outputPath, { flags: 'wx' });
+const requestedBudget = Number.isFinite(requestedMaxBytes) && requestedMaxBytes > 0
+  ? requestedMaxBytes : 128 * 1024 * 1024;
+const diskReserve = Number.isFinite(reserveBytes) && reserveBytes >= 0
+  ? reserveBytes : 64 * 1024 * 1024;
+const queueLimit = Number.isFinite(maxQueuedBytes) && maxQueuedBytes > 0
+  ? maxQueuedBytes : 4 * 1024 * 1024;
+let diskBudget = 0;
+try {
+  const stats = fs.statfsSync(outputDir);
+  const freeBytes = Number(stats.bavail) * Number(stats.bsize);
+  diskBudget = Math.max(0, Math.min(requestedBudget, freeBytes - diskReserve));
+} catch (error) {
+  console.error(`Unable to check capture disk space: ${error.message}`);
+}
 let stopping = false;
+let outputFailed = false;
+let outputEnded = false;
+let outputBlocked = false;
+let finishRequested = false;
+let outputBytes = 0;
+let queuedBytes = 0;
+const writeQueue = [];
+let stopCapture = null;
+let discoveryTimer = null;
+let durationTimer = null;
 let kalshiWs;
 let binanceWs;
 let kalshiRetryMs = 1000;
@@ -52,9 +79,76 @@ let bookStates = new Map();
 let lastSequences = new Map();
 let binancePrices = [];
 
+function pauseFeeds() {
+  for (const ws of [kalshiWs, binanceWs]) {
+    if (ws && typeof ws.pause === 'function') ws.pause();
+  }
+}
+
+function resumeFeeds() {
+  if (stopping) return;
+  for (const ws of [kalshiWs, binanceWs]) {
+    if (ws && typeof ws.resume === 'function') ws.resume();
+  }
+}
+
+function finishOutputIfReady() {
+  if (!finishRequested || outputEnded || outputFailed || outputBlocked || writeQueue.length) return;
+  outputEnded = true;
+  output.end(() => console.log(`Capture saved: ${outputPath}`));
+}
+
+function flushOutputQueue() {
+  outputBlocked = false;
+  while (writeQueue.length) {
+    const line = writeQueue.shift();
+    queuedBytes -= Buffer.byteLength(line);
+    if (!output.write(line)) {
+      outputBlocked = true;
+      pauseFeeds();
+      return;
+    }
+  }
+  resumeFeeds();
+  finishOutputIfReady();
+}
+
+output.on('drain', flushOutputQueue);
+output.on('error', error => {
+  outputFailed = true;
+  console.error(`Capture output failed (${error.code || 'write error'}): ${error.message}`);
+  if (stopCapture) stopCapture('output_error');
+});
+
+function writeLine(line) {
+  if (outputFailed || outputEnded) return false;
+  const bytes = Buffer.byteLength(line);
+  if (outputBytes + bytes > diskBudget) {
+    if (stopCapture) stopCapture('disk_budget_reached');
+    return false;
+  }
+  if (outputBlocked || writeQueue.length) {
+    if (queuedBytes + bytes > queueLimit) {
+      if (stopCapture) stopCapture('write_queue_limit_reached');
+      return false;
+    }
+    writeQueue.push(line);
+    queuedBytes += bytes;
+    outputBytes += bytes;
+    return true;
+  }
+  outputBytes += bytes;
+  if (!output.write(line)) {
+    outputBlocked = true;
+    pauseFeeds();
+  }
+  return true;
+}
+
 function writeEvent(type, payload, sourceTs = null, receivedAt = Date.now()) {
+  if (outputFailed || outputEnded || (stopping && type !== 'capture_stopped')) return false;
   const record = { schema_version: 1, type, series_ticker: seriesTicker, source_ts_ms: sourceTs, received_at_ms: receivedAt, payload };
-  if (!output.write(`${JSON.stringify(record)}\n`)) output.once('drain', () => {});
+  return writeLine(`${JSON.stringify(record)}\n`);
 }
 
 function marketTickerFrom(raw) { return raw.market_ticker || raw.ticker || null; }
@@ -256,30 +350,40 @@ async function refreshSettlements() {
   }
 }
 
+function stopCaptureNow(reason = 'requested') {
+  if (stopping) return;
+  stopping = true;
+  if (discoveryTimer) clearInterval(discoveryTimer);
+  if (durationTimer) clearTimeout(durationTimer);
+  if (reason !== 'requested') console.error(`Stopping capture safely: ${reason}`);
+  writeEvent('capture_stopped', { elapsed_ms: Date.now() - startTime, reason });
+  for (const ws of [kalshiWs, binanceWs]) {
+    if (ws && ws.readyState < WebSocket.CLOSING) ws.close();
+  }
+  finishRequested = true;
+  finishOutputIfReady();
+}
+
+stopCapture = stopCaptureNow;
+
 async function main() {
-  console.log(`Capturing ${seriesTicker} event markets and ${binanceSymbol.toUpperCase()} reference quotes to ${outputPath}`);
+  if (diskBudget <= 0) {
+    stopCapture('disk_reserve_reached');
+    return;
+  }
+  console.log(`Capturing ${seriesTicker} event markets and ${binanceSymbol.toUpperCase()} reference quotes to ${outputPath} (max ${diskBudget} bytes)`);
   console.log('Data-only: this process has no order-placement or cancellation calls. Press Ctrl+C to stop.');
+  process.on('SIGINT', () => stopCapture('requested'));
+  process.on('SIGTERM', () => stopCapture('requested'));
   writeEvent('capture_started', { series_ticker: seriesTicker, binance_symbol: binanceSymbol, interval_ms: intervalMs });
+  if (stopping) return;
   connectKalshi();
   connectBinance();
   await refreshMarkets();
-  const discoveryTimer = setInterval(refreshMarkets, intervalMs);
-  const durationTimer = stopAfterMinutes > 0 ? setTimeout(stop, stopAfterMinutes * 60000) : null;
-  process.on('SIGINT', stop);
-  process.on('SIGTERM', stop);
-  async function stop() {
-    if (stopping) return;
-    stopping = true;
-    clearInterval(discoveryTimer);
-    if (durationTimer) clearTimeout(durationTimer);
-    writeEvent('capture_stopped', { elapsed_ms: Date.now() - startTime });
-    for (const ws of [kalshiWs, binanceWs]) {
-      if (ws && ws.readyState < WebSocket.CLOSING) ws.close();
-    }
-    output.end(() => console.log(`Capture saved: ${outputPath}`));
-  }
+  if (stopping) return;
+  discoveryTimer = setInterval(refreshMarkets, intervalMs);
+  durationTimer = stopAfterMinutes > 0 ? setTimeout(() => stopCapture('duration_limit_reached'), stopAfterMinutes * 60000) : null;
 }
-
 main().catch(error => {
   console.error(error.stack || error.message);
   process.exitCode = 1;
