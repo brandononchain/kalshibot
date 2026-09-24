@@ -30,7 +30,7 @@ CAPTURE_OUTPUT_DIR=./data/captures
 CAPTURE_DURATION_MINUTES=0
 ```
 
-`CAPTURE_DURATION_MINUTES=0` means keep running until stopped. Keep the computer awake and the process running for continuous coverage. The collector reconnects to both WebSockets after disconnects and records connection errors and gaps.
+`CAPTURE_DURATION_MINUTES=0` means keep running until stopped. When running locally, keep the computer awake and process running for continuous coverage. For a cloud worker, follow [the Railway deployment guide](railway-market-capture.md). The collector reconnects to both WebSockets after disconnects and records connection errors and gaps.
 
 ## Event format
 
