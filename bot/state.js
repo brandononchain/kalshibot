@@ -33,6 +33,7 @@ class BotState extends EventEmitter {
 
     // Market open reference price (for calculating move %)
     this.marketOpenPrices = {};
+    this.marketOpenPriceMeta = {};
     this.marketOpenPriceStale = {}; // Flags for open prices set late (discovered after open)
 
     // Kalshi account

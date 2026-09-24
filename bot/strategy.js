@@ -11,6 +11,8 @@
  * with realized volatility from Binance feed.
  */
 
+const { estimateTakerFeeDollars, expectedValuePerContract, kellyBankrollFraction } = require('../lib/kalshi-economics');
+
 class Strategy {
   constructor(state, config, binanceFeed, trendIndicator = null) {
     this.state = state;
@@ -26,8 +28,8 @@ class Strategy {
     this.tradingWindow = (config.TRADING_WINDOW || 4) * 60 * 1000; // minutes to ms
 
     // Price filters — skip contracts outside the profitable range
-    this.minContractPrice = (config.MIN_CONTRACT_PRICE || 48) / 100; // cents to decimal
-    this.maxContractPrice = (config.MAX_CONTRACT_PRICE || 88) / 100;
+    this.minContractPrice = (config.MIN_CONTRACT_PRICE ?? 35) / 100; // cents to decimal
+    this.maxContractPrice = (config.MAX_CONTRACT_PRICE ?? 65) / 100;
 
     // 1H trend integration — multiplicative edge modifier
     this.trendEnabled = config.TREND_ENABLED !== false;
@@ -125,12 +127,10 @@ class Strategy {
   }
 
   // Kelly criterion position sizing
-  kellySize(edge, probability) {
-    if (probability <= 0.01 || probability >= 0.99) return 0;
-    const b = (1 / (1 - probability)) - 1;
-    const q = 1 - probability;
-    const kelly = (b * probability - q) / b;
-    return Math.max(0, Math.min(kelly * this.kellyFraction, 0.25));
+  kellySize(edge, probability, executablePrice) {
+    const feeRate = this.config.KALSHI_TAKER_FEE_RATE ?? 0.07;
+    const fee = estimateTakerFeeDollars(executablePrice, 1, feeRate);
+    return kellyBankrollFraction(probability, executablePrice, fee, this.kellyFraction);
   }
 
   /**
@@ -155,7 +155,8 @@ class Strategy {
 
       // Get open price for this market
       const openPrice = this.state.marketOpenPrices[market.ticker];
-      if (!openPrice) continue;
+      const referenceMeta = this.state.marketOpenPriceMeta?.[market.ticker];
+      if (!openPrice || !referenceMeta || referenceMeta.source !== 'binance_at_market_open' || Math.abs(referenceMeta.timestamp - market.openTime) > 2500) continue;
 
       // Get Kalshi prices
       if (!market.yesAsk || !market.noAsk) continue;
@@ -191,27 +192,29 @@ class Strategy {
       // ===== STRATEGY 1: DIRECTIONAL (Binance spot divergence) =====
       // Compare model probability with Kalshi contract price
       const kalshiYesImplied = market.yesAsk; // What you'd pay for YES
-      const modelEdgeYes = (prob.probUp - kalshiYesImplied) * 100;
-      const modelEdgeNo = (prob.probDown - market.noAsk) * 100;
+      const feeRate = this.config.KALSHI_TAKER_FEE_RATE ?? 0.07;
+      const feeMultiplier = market.feeMultiplier ?? 1;
+      const modelEdgeYes = expectedValuePerContract(prob.probUp, market.yesAsk, estimateTakerFeeDollars(market.yesAsk, 1, feeRate, feeMultiplier)) * 100;
+      const modelEdgeNo = expectedValuePerContract(prob.probDown, market.noAsk, estimateTakerFeeDollars(market.noAsk, 1, feeRate, feeMultiplier)) * 100;
 
       // Apply 1H trend multiplier to DIRECTIONAL edges
       const trendMultYes = this.getTrendMultiplier('yes');
       const trendMultNo = this.getTrendMultiplier('no');
-      const adjustedEdgeYes = modelEdgeYes * trendMultYes;
-      const adjustedEdgeNo = modelEdgeNo * trendMultNo;
+      const adjustedEdgeYes = modelEdgeYes;
+      const adjustedEdgeNo = modelEdgeNo;
       const currentTrend = trendData.trend || 'NEUTRAL';
 
       // BUY YES: model thinks UP is more likely than Kalshi price implies
       if (adjustedEdgeYes > this.minDivergence && yesInRange) {
         const size = this.useKelly
-          ? this.kellySize(adjustedEdgeYes / 100, prob.probUp)
+          ? this.kellySize(adjustedEdgeYes / 100, prob.probUp, market.yesAsk)
           : 1;
         const positionDollars = Math.min(
           size * this.state.balance.available,
           this.maxPositionSize,
           this.state.balance.available
         );
-        const contracts = Math.max(1, Math.floor(positionDollars / market.yesAsk));
+        const contracts = Math.max(1, Math.floor(positionDollars / (market.yesAsk + estimateTakerFeeDollars(market.yesAsk, 1, this.config.KALSHI_TAKER_FEE_RATE ?? 0.07))));
 
         signals.push({
           type: 'DIRECTIONAL_YES',
@@ -231,14 +234,14 @@ class Strategy {
       // BUY NO: model thinks DOWN is more likely
       if (adjustedEdgeNo > this.minDivergence && noInRange) {
         const size = this.useKelly
-          ? this.kellySize(adjustedEdgeNo / 100, prob.probDown)
+          ? this.kellySize(adjustedEdgeNo / 100, prob.probDown, market.noAsk)
           : 1;
         const positionDollars = Math.min(
           size * this.state.balance.available,
           this.maxPositionSize,
           this.state.balance.available
         );
-        const contracts = Math.max(1, Math.floor(positionDollars / market.noAsk));
+        const contracts = Math.max(1, Math.floor(positionDollars / (market.noAsk + estimateTakerFeeDollars(market.noAsk, 1, this.config.KALSHI_TAKER_FEE_RATE ?? 0.07))));
 
         signals.push({
           type: 'DIRECTIONAL_NO',
@@ -257,15 +260,15 @@ class Strategy {
 
       // ===== STRATEGY 2: POLYMARKET ARBITRAGE =====
       if (poly) {
-        const polyFairUp = poly.upMid;
+        const polyFairUp = poly.upSell;
         const polyFairDown = poly.downMid;
 
         // Buy YES on Kalshi if Polymarket says it's worth more
         // Require higher edge for poly arb (1.5x base) — data shows poly signals are less reliable
-        const polyEdgeYes = (polyFairUp - market.yesAsk) * 100;
+        const polyEdgeYes = expectedValuePerContract(polyFairUp, market.yesAsk, estimateTakerFeeDollars(market.yesAsk, 1, this.config.KALSHI_TAKER_FEE_RATE ?? 0.07)) * 100;
         if (polyEdgeYes > this.minEdge * 1.5 && yesInRange) {
           const size = this.useKelly
-            ? this.kellySize(polyEdgeYes / 100, polyFairUp)
+            ? this.kellySize(polyEdgeYes / 100, polyFairUp, market.yesAsk)
             : 1;
           const positionDollars = Math.min(
             size * this.state.balance.available,
@@ -291,44 +294,7 @@ class Strategy {
         // POLY_ARB_NO disabled — data shows 25% win rate (1W/3L), actively harmful
       }
 
-      // ===== STRATEGY 3: DUAL-SIDE ARBITRAGE =====
-      // If YES_ask + NO_ask < $1, buy BOTH for guaranteed profit
-      const combinedCost = market.yesAsk + market.noAsk;
-      if (combinedCost < 0.98) { // Less than 98 cents combined
-        const guaranteedProfit = (1 - combinedCost) * 100; // in cents
-        const positionDollars = Math.min(this.maxPositionSize / 2, this.state.balance.available / 2);
-        const contracts = Math.max(1, Math.floor(positionDollars / Math.max(market.yesAsk, market.noAsk)));
-
-        signals.push({
-          type: 'DUAL_SIDE_YES',
-          ticker: market.ticker,
-          side: 'yes',
-          priceCents: Math.round(market.yesAsk * 100),
-          priceDecimal: market.yesAsk,
-          edge: guaranteedProfit,
-          contracts,
-          modelProb: prob.probUp,
-          reason: `Dual-side: YES@${(market.yesAsk * 100).toFixed(0)} + NO@${(market.noAsk * 100).toFixed(0)} = ${(combinedCost * 100).toFixed(0)}c < $1`,
-          closeTime: market.closeTime,
-          isDualSide: true,
-          executionMode: 'taker',
-        });
-
-        signals.push({
-          type: 'DUAL_SIDE_NO',
-          ticker: market.ticker,
-          side: 'no',
-          priceCents: Math.round(market.noAsk * 100),
-          priceDecimal: market.noAsk,
-          edge: guaranteedProfit,
-          contracts,
-          modelProb: prob.probDown,
-          reason: `Dual-side: YES@${(market.yesAsk * 100).toFixed(0)} + NO@${(market.noAsk * 100).toFixed(0)} = ${(combinedCost * 100).toFixed(0)}c < $1`,
-          closeTime: market.closeTime,
-          isDualSide: true,
-          executionMode: 'taker',
-        });
-      }
+      // Disabled: the two sides are separate orders and are not atomic.
     }
 
     // Sort by edge (highest first)

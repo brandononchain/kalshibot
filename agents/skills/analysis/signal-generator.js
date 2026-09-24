@@ -15,6 +15,7 @@
  */
 
 const BaseSkill = require('../../core/base-skill');
+const { estimateTakerFeeDollars, expectedValuePerContract, sizeContracts } = require('../../../lib/kalshi-economics');
 
 class SignalGenerator extends BaseSkill {
   constructor() {
@@ -43,12 +44,12 @@ class SignalGenerator extends BaseSkill {
 
     this.minEdge = config.MIN_EDGE || 10.0;
     this.minDivergence = config.MIN_DIVERGENCE || 10.0;
-    this.kellyFraction = config.KELLY_FRACTION || 0.25;
+    this.kellyFraction = config.KELLY_FRACTION ?? 0.08;
     this.useKelly = config.USE_KELLY_SIZING !== false;
     this.maxPositionSize = config.MAX_POSITION_SIZE || 25;
     this.tradingWindow = (config.TRADING_WINDOW || 4) * 60 * 1000;
-    this.minContractPrice = (config.MIN_CONTRACT_PRICE || 48) / 100;
-    this.maxContractPrice = (config.MAX_CONTRACT_PRICE || 88) / 100;
+    this.minContractPrice = (config.MIN_CONTRACT_PRICE ?? 35) / 100;
+    this.maxContractPrice = (config.MAX_CONTRACT_PRICE ?? 65) / 100;
   }
 
   async handleTask(task) {
@@ -91,7 +92,8 @@ class SignalGenerator extends BaseSkill {
       if (timeSinceOpen > this.tradingWindow || timeRemaining < 30000) continue;
 
       const openPrice = state.marketOpenPrices[market.ticker];
-      if (!openPrice) continue;
+      const referenceMeta = state.marketOpenPriceMeta?.[market.ticker];
+      if (!openPrice || !referenceMeta || referenceMeta.source !== 'binance_at_market_open' || Math.abs(referenceMeta.timestamp - market.openTime) > 2500) continue;
       if (!market.yesAsk || !market.noAsk) continue;
 
       const yesInRange = market.yesAsk >= this.minContractPrice && market.yesAsk <= this.maxContractPrice;
@@ -120,89 +122,59 @@ class SignalGenerator extends BaseSkill {
         trendWarmup: trendData.warmup || false,
       });
 
-      // ===== STRATEGY 1: DIRECTIONAL =====
-      const kalshiYesImplied = market.yesAsk;
-      const modelEdgeYes = (prob.probUp - kalshiYesImplied) * 100;
-      const modelEdgeNo = (prob.probDown - market.noAsk) * 100;
-
+      // All entry economics use Kalshi's executable ask and a fee estimate.
+      const feeRate = this.context.config.KALSHI_TAKER_FEE_RATE ?? 0.07;
+      const feeMultiplier = market.feeMultiplier ?? 1;
+      const emitDirectional = (side, probability, ask, askCents, _trendMultiplier, trendLabel) => {
+        if (!Number.isFinite(ask) || ask <= 0 || ask >= 1) return;
+        const fee = estimateTakerFeeDollars(ask, 1, feeRate, feeMultiplier);
+        const netEv = expectedValuePerContract(probability, ask, fee);
+        const adjustedEdge = netEv * 100;
+        const inRange = ask >= this.minContractPrice && ask <= this.maxContractPrice;
+        if (adjustedEdge < this.minDivergence || !inRange) return;
+        const contracts = this.useKelly
+          ? sizeContracts(probability, ask, state.balance.available, this.maxPositionSize, feeRate, feeMultiplier, this.kellyFraction)
+          : Math.floor(Math.min(state.balance.available, this.maxPositionSize) / (ask + fee));
+        if (contracts < 1) return;
+        signals.push({
+          type: side === 'yes' ? 'DIRECTIONAL_YES' : 'DIRECTIONAL_NO', ticker: market.ticker, side,
+          priceCents: askCents || Math.round(ask * 100), priceDecimal: ask,
+          edge: adjustedEdge, expectedValue: netEv, estimatedEntryFee: estimateTakerFeeDollars(ask, contracts, feeRate, feeMultiplier),
+          contracts, modelProb: probability,
+          reason: `Net EV ${(netEv * 100).toFixed(2)}¢/contract | model ${(probability * 100).toFixed(1)}% vs executable ask ${(ask * 100).toFixed(1)}% | 1H: ${trendLabel}`,
+          closeTime: market.closeTime, executionMode: 'taker',
+        });
+      };
       const trendMultYes = trendSkill.getTrendMultiplier('yes');
       const trendMultNo = trendSkill.getTrendMultiplier('no');
-      const adjustedEdgeYes = modelEdgeYes * trendMultYes;
-      const adjustedEdgeNo = modelEdgeNo * trendMultNo;
       const currentTrend = trendData.trend || 'NEUTRAL';
+      emitDirectional('yes', prob.probUp, market.yesAsk, market.yesAskCents, trendMultYes, currentTrend);
+      emitDirectional('no', prob.probDown, market.noAsk, market.noAskCents, trendMultNo, currentTrend);
 
-      if (adjustedEdgeYes > this.minDivergence && yesInRange) {
-        const size = this.useKelly ? probModel.kellySize(adjustedEdgeYes / 100, prob.probUp, this.kellyFraction) : 1;
-        const positionDollars = Math.min(size * state.balance.available, this.maxPositionSize, state.balance.available);
-        const contracts = Math.max(1, Math.floor(positionDollars / market.yesAsk));
-
-        signals.push({
-          type: 'DIRECTIONAL_YES', ticker: market.ticker, side: 'yes',
-          priceCents: market.yesAskCents || Math.round(market.yesAsk * 100),
-          priceDecimal: market.yesAsk, edge: adjustedEdgeYes, contracts,
-          modelProb: prob.probUp,
-          reason: `Spot +${(prob.movePct || 0).toFixed(3)}% | Model ${(prob.probUp * 100).toFixed(0)}% vs Kalshi ${(kalshiYesImplied * 100).toFixed(0)}% | 1H: ${currentTrend}${trendMultYes !== 1.0 ? ' (' + trendMultYes.toFixed(2) + 'x)' : ''}`,
-          closeTime: market.closeTime, executionMode: 'taker',
-        });
-      }
-
-      if (adjustedEdgeNo > this.minDivergence && noInRange) {
-        const size = this.useKelly ? probModel.kellySize(adjustedEdgeNo / 100, prob.probDown, this.kellyFraction) : 1;
-        const positionDollars = Math.min(size * state.balance.available, this.maxPositionSize, state.balance.available);
-        const contracts = Math.max(1, Math.floor(positionDollars / market.noAsk));
-
-        signals.push({
-          type: 'DIRECTIONAL_NO', ticker: market.ticker, side: 'no',
-          priceCents: market.noAskCents || Math.round(market.noAsk * 100),
-          priceDecimal: market.noAsk, edge: adjustedEdgeNo, contracts,
-          modelProb: prob.probDown,
-          reason: `Spot ${(prob.movePct || 0).toFixed(3)}% | Model ${(prob.probDown * 100).toFixed(0)}% vs Kalshi ${(market.noAsk * 100).toFixed(0)}% | 1H: ${currentTrend}${trendMultNo !== 1.0 ? ' (' + trendMultNo.toFixed(2) + 'x)' : ''}`,
-          closeTime: market.closeTime, executionMode: 'taker',
-        });
-      }
-
-      // ===== STRATEGY 2: POLYMARKET ARBITRAGE =====
-      if (poly) {
-        const polyEdgeYes = (poly.upMid - market.yesAsk) * 100;
-        if (polyEdgeYes > this.minEdge * 1.5 && yesInRange) {
-          const size = this.useKelly ? probModel.kellySize(polyEdgeYes / 100, poly.upMid, this.kellyFraction) : 1;
-          const positionDollars = Math.min(size * state.balance.available, this.maxPositionSize);
-          const contracts = Math.max(1, Math.floor(positionDollars / market.yesAsk));
-
-          signals.push({
+      // Cross-venue signal uses Polymarket's executable sell quote (bid), not midpoint.
+      // It remains a probability proxy and is only eligible when both feeds are fresh.
+      if (poly && Number.isFinite(poly.upSell) && Date.now() - poly.fetchedAt <= 5000) {
+        const ask = market.yesAsk;
+        const fee = estimateTakerFeeDollars(ask, 1, feeRate, feeMultiplier);
+        const netEv = expectedValuePerContract(poly.upSell, ask, fee);
+        if (netEv * 100 >= this.minEdge * 1.5 && ask >= this.minContractPrice && ask <= this.maxContractPrice) {
+          const contracts = this.useKelly
+            ? sizeContracts(poly.upSell, ask, state.balance.available, this.maxPositionSize, feeRate, feeMultiplier, this.kellyFraction)
+            : Math.floor(Math.min(state.balance.available, this.maxPositionSize) / (ask + fee));
+          if (contracts > 0) signals.push({
             type: 'POLY_ARB_YES', ticker: market.ticker, side: 'yes',
-            priceCents: market.yesAskCents || Math.round(market.yesAsk * 100),
-            priceDecimal: market.yesAsk, edge: polyEdgeYes, contracts,
-            modelProb: poly.upMid,
-            reason: `Poly UP mid=${(poly.upMid * 100).toFixed(1)}% vs Kalshi ask=${(market.yesAsk * 100).toFixed(1)}%`,
+            priceCents: market.yesAskCents || Math.round(ask * 100), priceDecimal: ask,
+            edge: netEv * 100, expectedValue: netEv,
+            estimatedEntryFee: estimateTakerFeeDollars(ask, contracts, feeRate, feeMultiplier),
+            contracts, modelProb: poly.upSell,
+            reason: `Poly executable bid ${(poly.upSell * 100).toFixed(1)}% vs Kalshi ask ${(ask * 100).toFixed(1)}%; fee-adjusted EV ${(netEv * 100).toFixed(2)}¢/contract`,
             closeTime: market.closeTime, executionMode: 'taker',
           });
         }
       }
 
-      // ===== STRATEGY 3: DUAL-SIDE ARBITRAGE =====
-      const combinedCost = market.yesAsk + market.noAsk;
-      if (combinedCost < 0.98) {
-        const guaranteedProfit = (1 - combinedCost) * 100;
-        const positionDollars = Math.min(this.maxPositionSize / 2, state.balance.available / 2);
-        const contracts = Math.max(1, Math.floor(positionDollars / Math.max(market.yesAsk, market.noAsk)));
+      // Dual-side entry is disabled until the venue supports paired atomic execution.
 
-        signals.push({
-          type: 'DUAL_SIDE_YES', ticker: market.ticker, side: 'yes',
-          priceCents: Math.round(market.yesAsk * 100), priceDecimal: market.yesAsk,
-          edge: guaranteedProfit, contracts, modelProb: prob.probUp,
-          reason: `Dual-side: YES@${(market.yesAsk * 100).toFixed(0)} + NO@${(market.noAsk * 100).toFixed(0)} = ${(combinedCost * 100).toFixed(0)}c < $1`,
-          closeTime: market.closeTime, isDualSide: true, executionMode: 'taker',
-        });
-
-        signals.push({
-          type: 'DUAL_SIDE_NO', ticker: market.ticker, side: 'no',
-          priceCents: Math.round(market.noAsk * 100), priceDecimal: market.noAsk,
-          edge: guaranteedProfit, contracts, modelProb: prob.probDown,
-          reason: `Dual-side: YES@${(market.yesAsk * 100).toFixed(0)} + NO@${(market.noAsk * 100).toFixed(0)} = ${(combinedCost * 100).toFixed(0)}c < $1`,
-          closeTime: market.closeTime, isDualSide: true, executionMode: 'taker',
-        });
-      }
     }
 
     signals.sort((a, b) => b.edge - a.edge);

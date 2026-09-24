@@ -8,6 +8,7 @@
     "legacy": "node kalshi-bot.js",
     "dev": "node server.js",
     "backtest": "node backtest/backtest.js",
+    "test": "node --test tests/*.test.js",
     "backtest:verbose": "node backtest/backtest.js --verbose",
     "backtest:30d": "node backtest/backtest.js --days 30"
   },
