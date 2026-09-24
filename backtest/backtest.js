@@ -672,8 +672,22 @@ async function main() {
   const options = {};
 
   for (let i = 0; i < args.length; i++) {
-    if (args[i] === '--days' && args[i + 1]) options.days = parseInt(args[i + 1]);
-    if (args[i] === '--start' && args[i + 1]) options.start = args[i + 1];
+    if (args[i] === '--days' && args[i + 1]) {
+      const days = parseInt(args[i + 1], 10);
+      if (!Number.isInteger(days) || days <= 0 || days > 3650) {
+        console.error('Invalid --days value: must be a positive integer (<= 3650)');
+        process.exit(1);
+      }
+      options.days = days;
+    }
+    if (args[i] === '--start' && args[i + 1]) {
+      const start = args[i + 1];
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(start) || isNaN(new Date(start).getTime())) {
+        console.error('Invalid --start value: expected date format YYYY-MM-DD');
+        process.exit(1);
+      }
+      options.start = start;
+    }
     if (args[i] === '--verbose' || args[i] === '-v') options.verbose = true;
     if (args[i] === '--conservative') {
       CONFIG.MAX_POSITION_SIZE = 3;
