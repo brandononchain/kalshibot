@@ -140,7 +140,7 @@ class KalshiMarketData extends BaseSkill {
           noBidCents: m.no_bid,
           noAskCents: m.no_ask,
           lastPrice: m.last_price / 100,
-          feeMultiplier: Number(m.fee_multiplier) || 1,
+          feeMultiplier: m.fee_multiplier == null || !Number.isFinite(Number(m.fee_multiplier)) ? 1 : Number(m.fee_multiplier),
           minutesUntilClose: Math.floor((closeTime - now) / 60000),
           secondsUntilClose: Math.floor((closeTime - now) / 1000),
           status: m.status,

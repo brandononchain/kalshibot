@@ -127,9 +127,9 @@ class Strategy {
   }
 
   // Kelly criterion position sizing
-  kellySize(edge, probability, executablePrice) {
+  kellySize(edge, probability, executablePrice, feeMultiplier = 1) {
     const feeRate = this.config.KALSHI_TAKER_FEE_RATE ?? 0.07;
-    const fee = estimateTakerFeeDollars(executablePrice, 1, feeRate);
+    const fee = estimateTakerFeeDollars(executablePrice, 1, feeRate, feeMultiplier);
     return kellyBankrollFraction(probability, executablePrice, fee, this.kellyFraction);
   }
 
@@ -207,14 +207,14 @@ class Strategy {
       // BUY YES: model thinks UP is more likely than Kalshi price implies
       if (adjustedEdgeYes > this.minDivergence && yesInRange) {
         const size = this.useKelly
-          ? this.kellySize(adjustedEdgeYes / 100, prob.probUp, market.yesAsk)
+          ? this.kellySize(adjustedEdgeYes / 100, prob.probUp, market.yesAsk, market.feeMultiplier ?? 1)
           : 1;
         const positionDollars = Math.min(
           size * this.state.balance.available,
           this.maxPositionSize,
           this.state.balance.available
         );
-        const contracts = Math.max(1, Math.floor(positionDollars / (market.yesAsk + estimateTakerFeeDollars(market.yesAsk, 1, this.config.KALSHI_TAKER_FEE_RATE ?? 0.07))));
+        const contracts = Math.max(1, Math.floor(positionDollars / (market.yesAsk + estimateTakerFeeDollars(market.yesAsk, 1, this.config.KALSHI_TAKER_FEE_RATE ?? 0.07, market.feeMultiplier ?? 1))));
 
         signals.push({
           type: 'DIRECTIONAL_YES',
@@ -234,14 +234,14 @@ class Strategy {
       // BUY NO: model thinks DOWN is more likely
       if (adjustedEdgeNo > this.minDivergence && noInRange) {
         const size = this.useKelly
-          ? this.kellySize(adjustedEdgeNo / 100, prob.probDown, market.noAsk)
+          ? this.kellySize(adjustedEdgeNo / 100, prob.probDown, market.noAsk, market.feeMultiplier ?? 1)
           : 1;
         const positionDollars = Math.min(
           size * this.state.balance.available,
           this.maxPositionSize,
           this.state.balance.available
         );
-        const contracts = Math.max(1, Math.floor(positionDollars / (market.noAsk + estimateTakerFeeDollars(market.noAsk, 1, this.config.KALSHI_TAKER_FEE_RATE ?? 0.07))));
+        const contracts = Math.max(1, Math.floor(positionDollars / (market.noAsk + estimateTakerFeeDollars(market.noAsk, 1, this.config.KALSHI_TAKER_FEE_RATE ?? 0.07, market.feeMultiplier ?? 1))));
 
         signals.push({
           type: 'DIRECTIONAL_NO',
