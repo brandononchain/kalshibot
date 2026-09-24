@@ -45,6 +45,7 @@ let nextCommandId = 1;
 let bookSid = null;
 let tradeSid = null;
 let discovered = new Map();
+let discoveryInFlight = false;
 let pendingSettlement = new Map();
 let settlementRetryAt = new Map();
 let bookStates = new Map();
@@ -192,6 +193,8 @@ function connectBinance() {
 }
 
 async function refreshMarkets() {
+  if (discoveryInFlight || stopping) return;
+  discoveryInFlight = true;
   try {
     const markets = await client.discoverMarkets(seriesTicker);
     const next = new Map(markets.filter(m => m.status === 'active' || m.status === 'open').map(m => [m.ticker, m]));
@@ -221,12 +224,14 @@ async function refreshMarkets() {
     writeEvent('market_universe', { tickers: [...after], count: after.size }, null, now);
   } catch (error) {
     writeEvent('capture_error', { stage: 'market_discovery', error: error.response?.data || error.message });
+  } finally {
+    discoveryInFlight = false;
   }
 }
 
 async function refreshSettlements() {
   const now = Date.now();
-  const due = [...pendingSettlement.keys()].filter(ticker => (settlementRetryAt.get(ticker) || 0) <= now);
+  const due = [...pendingSettlement.keys()].filter(ticker => (settlementRetryAt.get(ticker) || 0) <= now).slice(0, 5);
   for (const ticker of due) {
     settlementRetryAt.set(ticker, now + 30000);
     try {
@@ -240,7 +245,7 @@ async function refreshSettlements() {
         const prior = pendingSettlement.get(ticker) || {};
         const closeAt = Number(prior.closeTime) || Date.parse(prior.close_time || '');
         if (Number.isFinite(closeAt) && now - closeAt > 7 * 86400000) {
-        // Keep the capture bounded when the exchange no longer returns an outcome.
+          // Keep the capture bounded when the exchange no longer returns an outcome.
           pendingSettlement.delete(ticker);
           settlementRetryAt.delete(ticker);
         }
