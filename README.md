@@ -593,3 +593,8 @@ This software is provided for educational and research purposes only. Trading bi
 - Directional sizing uses the executable Kalshi ask, the standard taker-fee estimate (`rate × contracts × price × (1 − price)`, rounded up to a cent), and fee-adjusted fractional Kelly. Set `KALSHI_TAKER_FEE_RATE` for the applicable market schedule; the default `0.07` is the standard schedule and does not cover special fee multipliers.
 - The dual-side strategy is disabled because the two legs are submitted separately and are not atomic.
 - These code changes do not validate profitability. The existing synthetic backtest is not an event replay of historical Kalshi books. Do not treat its returns as evidence; calibration, realized-fill replay, and paper results must be produced from timestamped executable book observations and settlement outcomes before live deployment.
+
+
+## Event-market data capture
+
+Capture authenticated Kalshi order-book snapshots/deltas, public trades, market outcomes, and Binance BTC reference quotes for chronological research. The capture process is data-only and never places or cancels orders. See [the capture guide](docs/historical-market-capture.md). This is prospective data collection; it does not create missing historical order-book records or establish strategy profitability.
