@@ -148,7 +148,7 @@ function writeLine(line) {
 function writeEvent(type, payload, sourceTs = null, receivedAt = Date.now()) {
   if (outputFailed || outputEnded || (stopping && type !== 'capture_stopped')) return false;
   const record = { schema_version: 1, type, series_ticker: seriesTicker, source_ts_ms: sourceTs, received_at_ms: receivedAt, payload };
-  return writeLine(`${JSON.stringify(record)}\\n`);
+  return writeLine(`${JSON.stringify(record)}\n`);
 }
 
 function marketTickerFrom(raw) { return raw.market_ticker || raw.ticker || null; }
