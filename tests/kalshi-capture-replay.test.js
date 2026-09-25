@@ -70,6 +70,18 @@ test('a snapshot sequence jump restores only its market and invalidates other bo
   assert.equal(replayEngine.consume(delta('MKT-B', 4, 15))[0].type, 'replay_quote');
 });
 
+test('a snapshot without a sequence invalidates the entire identified stream', () => {
+  const replayEngine = new KalshiCaptureReplay();
+  replayEngine.consume(snapshot('MKT-A', 4, 10));
+  const invalid = replayEngine.consume(row('kalshi_ws', {
+    type: 'orderbook_snapshot', sid: 4, seq: null,
+    msg: { market_ticker: 'MKT-B', yes_dollars_fp: [['0.4', '1']], no_dollars_fp: [] },
+  }));
+  assert.equal(invalid[0].kind, 'invalid_snapshot');
+  assert.deepEqual(replayEngine.summary().valid_books_at_end, []);
+  assert.equal(replayEngine.consume(delta('MKT-A', 4, 11))[0].kind, 'sequence_baseline_missing');
+});
+
 test('trade-channel gaps do not invalidate a separate valid orderbook stream', () => {
   const replayEngine = new KalshiCaptureReplay();
   replayEngine.consume(snapshot('MKT-A', 4, 10));
