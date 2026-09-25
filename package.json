@@ -12,7 +12,8 @@
     "backtest:verbose": "node backtest/backtest.js --verbose",
     "backtest:30d": "node backtest/backtest.js --days 30",
     "capture:markets": "node scripts/capture-kalshi-history.js",
-    "capture:replay": "node scripts/replay-kalshi-capture.js"
+    "capture:replay": "node scripts/replay-kalshi-capture.js",
+    "capture:simulate": "node scripts/simulate-kalshi-capture.js"
   },
   "keywords": [
     "kalshi",
