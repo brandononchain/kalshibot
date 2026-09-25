@@ -8,6 +8,7 @@ const path = require('path');
 const WebSocket = require('ws');
 const KalshiClient = require('../bot/kalshi');
 const { normalizeSnapshot, applyDelta, executableQuotes, hasSequenceGap } = require('../lib/kalshi-orderbook');
+const { KalshiSubscriptionManager } = require('../lib/kalshi-subscriptions');
 
 const seriesTicker = process.env.CAPTURE_SERIES_TICKER || process.env.SERIES_TICKER || 'KXBTC15M';
 const binanceSymbol = (process.env.CAPTURE_BINANCE_SYMBOL || 'btcusdt').toLowerCase();
@@ -191,6 +192,12 @@ function updateSubscription(ws, sid, tickers, action) {
   }));
 }
 
+const subscriptions = new KalshiSubscriptionManager({
+  isOpen: ws => ws.readyState === WebSocket.OPEN,
+  subscribe: (ws, channel, tickers) => sendSubscribe(ws, [channel], tickers),
+  update: (ws, sid, tickers, action) => updateSubscription(ws, sid, tickers, action),
+});
+
 function connectKalshi() {
   if (stopping) return;
   const auth = client.generateAuth('GET', '/trade-api/ws/v2').headers;
@@ -198,11 +205,7 @@ function connectKalshi() {
   kalshiWs.on('open', () => {
     kalshiRetryMs = 1000;
     writeEvent('connection', { service: 'kalshi', status: 'connected', url: wsUrl() });
-    const tickers = [...discovered.keys()];
-    if (tickers.length) {
-      sendSubscribe(kalshiWs, ['orderbook_delta'], tickers);
-      sendSubscribe(kalshiWs, ['trade'], tickers);
-    }
+    subscriptions.setSocket(kalshiWs);
   });
   kalshiWs.on('message', raw => {
     const receivedAt = Date.now();
@@ -213,6 +216,7 @@ function connectKalshi() {
     }
     if (message.type === 'subscribed' && message.msg?.channel === 'orderbook_delta') bookSid = message.msg.sid;
     if (message.type === 'subscribed' && message.msg?.channel === 'trade') tradeSid = message.msg.sid;
+    if (message.type === 'subscribed') subscriptions.subscribed(message.msg?.channel, message.msg?.sid);
     const ticker = message.msg?.market_ticker;
     if (message.type === 'orderbook_snapshot' && ticker) {
       bookStates.set(ticker, normalizeSnapshot(message));
@@ -239,6 +243,7 @@ function connectKalshi() {
   });
   kalshiWs.on('error', error => writeEvent('connection_error', { service: 'kalshi', error: error.message }));
   kalshiWs.on('close', (code, reason) => {
+    subscriptions.closed(kalshiWs);
     bookSid = tradeSid = null;
     lastSequences.clear();
     bookStates.clear();
@@ -296,24 +301,12 @@ async function refreshMarkets() {
     for (const [ticker, market] of next) {
       if (!discovered.has(ticker)) logMarket(market, now);
     }
-    const before = new Set(discovered.keys());
     const after = new Set(next.keys());
-    if (kalshiWs?.readyState === WebSocket.OPEN) {
-      const add = [...after].filter(ticker => !before.has(ticker));
-      const remove = [...before].filter(ticker => !after.has(ticker));
-      if (add.length) {
-        updateSubscription(kalshiWs, bookSid, add, 'add_markets');
-        updateSubscription(kalshiWs, tradeSid, add, 'add_markets');
-      }
-      if (remove.length) {
-        updateSubscription(kalshiWs, bookSid, remove, 'delete_markets');
-        updateSubscription(kalshiWs, tradeSid, remove, 'delete_markets');
-      }
-    }
     for (const [ticker, market] of discovered) {
       if (!next.has(ticker)) pendingSettlement.set(ticker, market);
     }
     discovered = next;
+    subscriptions.setMarkets([...next.keys()]);
     await refreshSettlements();
     writeEvent('market_universe', { tickers: [...after], count: after.size }, null, now);
   } catch (error) {
